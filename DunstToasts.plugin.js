@@ -44,12 +44,14 @@ module.exports = class DunstBridge {
         const actions = this.getMessageActions();
         if (!actions) return "Discord's sendMessage function was not found (Discord update?)";
         try {
+            // Signature is (channelId, message, waitForChannel, options). The options object must
+            // exist or Discord throws on `options.nonce`.
             await actions.sendMessage(channelId, {
                 content,
                 tts: false,
                 invalidEmojis: [],
                 validNonShortcutEmojis: []
-            });
+            }, undefined, {});
             return null;
         } catch (err) {
             console.error("[DunstBridge] sendMessage failed", err);
