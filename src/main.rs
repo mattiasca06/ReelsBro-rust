@@ -224,7 +224,7 @@ struct MediaCard {
     url: String,
 }
 
-/// The picture cards shown under the toast. All cards share one timer: 5s plus 3s per extra card.
+/// The picture cards shown under the toast. All cards share one timer: 8s plus 3s per extra card.
 #[derive(Default)]
 struct MediaGrid {
     cards: Vec<MediaCard>,
@@ -370,9 +370,9 @@ impl MediaGrid {
         }
     }
 
-    /// How long the cards stay up: 5s plus 3s per extra card. The toast stays up at least this long too.
+    /// How long the cards stay up: 8s plus 3s per extra card. The toast stays up at least this long too.
     fn duration_ms(&self) -> usize {
-        5000 + 3000 * self.cards.len().saturating_sub(1)
+        8000 + 3000 * self.cards.len().saturating_sub(1)
     }
 
     /// Re-lays out, restarts the shared countdown and schedules the moment all cards disappear together.
