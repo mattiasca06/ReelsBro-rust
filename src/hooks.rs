@@ -25,6 +25,28 @@ pub fn install(proxy: EventLoopProxy<CustomEvent>) {
         std::env::var("RICE_HOOK_STEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(400),
     );
 
+    // RICE_HOOK_REPLY=<text>: show a toast tied to channel "123456", then submit <text> as a reply to it.
+    // Check the result with `curl http://127.0.0.1:8999/outbox`.
+    if let Ok(text) = std::env::var("RICE_HOOK_REPLY") {
+        let proxy = proxy.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1500));
+            let _ = proxy.send_event(CustomEvent::ShowToast(crate::ToastPayload {
+                author: "HookUser".into(),
+                content: "hook message".into(),
+                avatar: "https://cdn.discordapp.com/embed/avatars/0.png".into(),
+                sound_path: None,
+                accent_color: None,
+                position: None,
+                test: true,
+                channel_id: Some("123456".into()),
+            }));
+            thread::sleep(step);
+            let _ = proxy.send_event(CustomEvent::Reply(text));
+        });
+        return;
+    }
+
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(1500));
         let _ = proxy.send_event(CustomEvent::SetPreview(true));

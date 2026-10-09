@@ -13,7 +13,7 @@ use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tao::{
@@ -40,7 +40,12 @@ struct ToastPayload {
     /// Set by the plugin's test buttons so reel extraction failures are surfaced as a toast.
     #[serde(default)]
     test: bool,
+    /// Discord channel the message came from; lets the toast reply back to it.
+    channel_id: Option<String>,
 }
+
+/// Replies typed into the toast, waiting for the plugin to pick them up via `GET /outbox`.
+type Outbox = Arc<Mutex<Vec<serde_json::Value>>>;
 
 #[derive(Debug, Clone)]
 struct ReelItem {
@@ -64,6 +69,10 @@ enum CustomEvent {
     SetPreview(bool),
     SetTheme(String),
     SaveSettings,
+    /// Text submitted from the toast's reply box.
+    Reply(String),
+    /// The reply box gained (true) or lost (false) focus.
+    ReplyActive(bool),
     Menu(tray_icon::menu::MenuId),
 }
 
@@ -372,7 +381,8 @@ fn main() {
     let hide_toast_if_reel = Arc::new(AtomicBool::new(false));
 
     // Start HTTP server on 127.0.0.1:8999
-    start_server(proxy.clone(), hide_toast_if_reel.clone());
+    let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+    start_server(proxy.clone(), hide_toast_if_reel.clone(), outbox.clone());
 
     let mut settings = load_settings();
     let mut preview_active = false;
@@ -445,6 +455,22 @@ fn main() {
             .msg-list::-webkit-scrollbar { width: 4px; }
             .msg-list::-webkit-scrollbar-thumb { background: rgba(203, 166, 247, 0.4); border-radius: 4px; }
 
+            .reply { display: none; flex-shrink: 0; }
+            .reply.on { display: flex; }
+            .reply input {
+                flex: 1;
+                min-width: 0;
+                background: rgba(255, 255, 255, 0.06);
+                border: 1.5px solid rgba(205, 214, 244, 0.25);
+                border-radius: 10px;
+                color: #cdd6f4;
+                font: inherit;
+                outline: none;
+                user-select: text;
+            }
+            .reply input:focus { border-color: var(--accent, #cba6f7); }
+            .reply input::placeholder { color: rgba(205, 214, 244, 0.45); }
+
             .msg-bubble {
                 flex: 1;
                 display: flex;
@@ -475,6 +501,8 @@ fn main() {
             body.full .author { font-size: 22px; margin-bottom: 10px; }
             body.full .msg-list { gap: 10px; padding-right: 4px; }
             body.full .msg-bubble { font-size: 17px; min-height: 48px; padding: 10px 16px; }
+            body.full .reply { margin-top: 10px; }
+            body.full .reply input { font-size: 16px; padding: 9px 14px; }
 
             @keyframes popIn {
                 from { opacity: 0; transform: translateY(4px); }
@@ -488,9 +516,37 @@ fn main() {
             <div class="info">
                 <div id="author" class="author"></div>
                 <div id="msg-list" class="msg-list"></div>
+                <div id="reply" class="reply">
+                    <input id="reply-input" type="text" placeholder="Reply…" autocomplete="off" spellcheck="false">
+                </div>
             </div>
         </div>
         <script>
+            const replyBox = document.getElementById('reply');
+            const replyInput = document.getElementById('reply-input');
+            let replyActive = false;
+
+            function setReplyActive(on) {
+                if (on === replyActive) return;
+                replyActive = on;
+                window.ipc.postMessage('reply_active:' + (on ? '1' : '0'));
+            }
+            function setReplyEnabled(on) {
+                replyBox.classList.toggle('on', on);
+            }
+            replyInput.addEventListener('focus', () => setReplyActive(true));
+            replyInput.addEventListener('blur', () => setReplyActive(false));
+            replyInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && replyInput.value.trim()) {
+                    window.ipc.postMessage('reply:' + replyInput.value.trim());
+                    replyInput.value = '';
+                    replyInput.blur();
+                } else if (e.key === 'Escape') {
+                    replyInput.value = '';
+                    replyInput.blur();
+                }
+            });
+
             function escapeHtml(text) {
                 const div = document.createElement('div');
                 div.textContent = text;
@@ -511,7 +567,9 @@ fn main() {
                 document.getElementById('avatar').src = avatar;
                 document.getElementById('avatar').style.borderColor = accent;
                 document.getElementById('toast').style.borderColor = accent;
+                document.getElementById('toast').style.setProperty('--accent', accent);
                 document.getElementById('msg-list').innerHTML = '';
+                replyInput.value = '';
             }
 
             function appendBubble(content, accent) {
@@ -529,6 +587,7 @@ fn main() {
     "#;
 
     let open_links_flag = open_links_enabled.clone();
+    let proxy_toast = proxy.clone();
     let toast_webview = WebViewBuilder::new()
         .with_transparent(true)
         .with_background_color((0, 0, 0, 0))
@@ -539,6 +598,10 @@ fn main() {
                 if open_links_flag.load(Ordering::Relaxed) {
                     let _ = open::that(url);
                 }
+            } else if let Some(text) = body.strip_prefix("reply:") {
+                let _ = proxy_toast.send_event(CustomEvent::Reply(text.to_string()));
+            } else if let Some(v) = body.strip_prefix("reply_active:") {
+                let _ = proxy_toast.send_event(CustomEvent::ReplyActive(v == "1"));
             }
         })
         .with_html(toast_html)
@@ -1352,6 +1415,8 @@ fn main() {
     let mut last_author: Option<String> = None;
     let mut last_time: Option<Instant> = None;
     let mut history: Vec<String> = Vec::new();
+    let mut last_channel: Option<String> = None;
+    let mut reply_active = false;
 
     // Reel Queue state
     let mut active_reel: Option<ReelItem> = None;
@@ -1403,12 +1468,14 @@ fn main() {
             Event::UserEvent(CustomEvent::SetPreview(on)) => {
                 preview_active = on;
                 last_author = None;
+                last_channel = None;
                 history.clear();
                 if on {
                     let js = "initThread('Preview', 'https://cdn.discordapp.com/embed/avatars/0.png', '#cba6f7'); \
                         appendBubble('This is how big your toasts are.', '#cba6f7'); \
                         appendBubble('A longer message wraps onto a second line so you can judge readability at this size, with room for a few more words.', '#cba6f7');";
                     let _ = toast_webview.evaluate_script(js);
+                    let _ = toast_webview.evaluate_script("setReplyEnabled(true);");
                     toast_window.set_visible(true);
                     toast_window.set_always_on_top(true);
                     if active_reel.is_none() {
@@ -1455,6 +1522,8 @@ fn main() {
                     let _ = toast_webview.evaluate_script(&js);
                 }
                 last_time = Some(now);
+                last_channel = payload.channel_id.clone();
+                let _ = toast_webview.evaluate_script(&format!("setReplyEnabled({});", last_channel.is_some()));
 
                 let total_chars: usize = history.iter().map(|m| m.len()).sum();
                 let reading_time_ms = (4500 + (total_chars * 45)).clamp(4500, 20000) as u64;
@@ -1489,10 +1558,34 @@ fn main() {
                 });
             },
             Event::UserEvent(CustomEvent::HideToast(id)) => {
-                if !preview_active && notification_counter.load(Ordering::SeqCst) == id {
+                if !preview_active && !reply_active && notification_counter.load(Ordering::SeqCst) == id {
                     toast_window.set_visible(false);
                     history.clear();
                     last_author = None;
+                    last_channel = None;
+                }
+            },
+            Event::UserEvent(CustomEvent::ReplyActive(active)) => {
+                reply_active = active;
+                if !active {
+                    // Give the toast a short grace period after the reply box loses focus.
+                    let id = notification_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let proxy_clone = proxy.clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(3000));
+                        let _ = proxy_clone.send_event(CustomEvent::HideToast(id));
+                    });
+                }
+            },
+            Event::UserEvent(CustomEvent::Reply(text)) => {
+                let text = text.trim();
+                if let (false, Some(channel_id)) = (text.is_empty(), last_channel.as_ref()) {
+                    outbox
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::json!({ "channel_id": channel_id, "content": text }));
+                    let js = format!("appendBubble({:?}, '#a6e3a1');", format!("You: {}", text));
+                    let _ = toast_webview.evaluate_script(&js);
                 }
             },
             Event::UserEvent(CustomEvent::ReelReady(item)) => {
@@ -1551,7 +1644,7 @@ fn main() {
     });
 }
 
-fn start_server(proxy: EventLoopProxy<CustomEvent>, hide_toast_if_reel: Arc<AtomicBool>) {
+fn start_server(proxy: EventLoopProxy<CustomEvent>, hide_toast_if_reel: Arc<AtomicBool>, outbox: Outbox) {
     thread::spawn(move || {
         let listener = TcpListener::bind("127.0.0.1:8999").expect("Failed to bind 127.0.0.1:8999");
 
@@ -1571,8 +1664,20 @@ fn start_server(proxy: EventLoopProxy<CustomEvent>, hide_toast_if_reel: Arc<Atom
                         continue;
                     }
 
+                    // The plugin polls this to collect replies typed into the toast.
+                    if request.starts_with("GET /outbox") {
+                        let replies = std::mem::take(&mut *outbox.lock().unwrap());
+                        let body = serde_json::Value::Array(replies).to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        continue;
+                    }
+
                     if request.starts_with("OPTIONS") {
-                        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n\r\n";
+                        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n\r\n";
                         let _ = stream.write_all(response.as_bytes());
                         continue;
                     }
@@ -1624,6 +1729,7 @@ fn start_server(proxy: EventLoopProxy<CustomEvent>, hide_toast_if_reel: Arc<Atom
                                             accent_color: Some("#f38ba8".to_string()),
                                             position: None,
                                             test: true,
+                                            channel_id: None,
                                         }));
                                     }
                                     Err(_) => {}

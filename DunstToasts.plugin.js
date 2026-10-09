@@ -2,7 +2,7 @@
  * @name DunstBridge
  * @author CustomRice
  * @description Bridges Discord pings & DMs to your local Rust Dunst server.
- * @version 2.1.0
+ * @version 2.2.0
  */
 
 module.exports = class DunstBridge {
@@ -21,12 +21,57 @@ module.exports = class DunstBridge {
 
         this.handleMessage = this.handleMessage.bind(this);
         this.dispatcher.subscribe("MESSAGE_CREATE", this.handleMessage);
+        this.outboxTimer = setInterval(() => this.pollOutbox(), 1000);
         BdApi.UI.showToast("DunstBridge Connected to Rust Server!", { type: "success" });
     }
 
     stop() {
         if (this.dispatcher && this.handleMessage) {
             this.dispatcher.unsubscribe("MESSAGE_CREATE", this.handleMessage);
+        }
+        clearInterval(this.outboxTimer);
+    }
+
+    // Discord's own message-sending function, the one the chat box calls. Looked up lazily so a
+    // Discord update that renames it only breaks replies, not notifications.
+    getMessageActions() {
+        return BdApi.Webpack.getByKeys("sendMessage", "receiveMessage");
+    }
+
+    // Sends `content` to a channel through the running Discord client. The channel does not need
+    // to be open. Returns null on success or an error string.
+    async sendReply(channelId, content) {
+        const actions = this.getMessageActions();
+        if (!actions) return "Discord's sendMessage function was not found (Discord update?)";
+        try {
+            await actions.sendMessage(channelId, {
+                content,
+                tts: false,
+                invalidEmojis: [],
+                validNonShortcutEmojis: []
+            });
+            return null;
+        } catch (err) {
+            console.error("[DunstBridge] sendMessage failed", err);
+            return String(err?.message || err);
+        }
+    }
+
+    // Collects replies typed into the Rust toast and sends them. Quiet when the server is down.
+    async pollOutbox() {
+        if (this.polling) return;
+        this.polling = true;
+        try {
+            const r = await fetch(`${this.serverUrl}/outbox`);
+            const replies = await r.json();
+            for (const { channel_id, content } of replies) {
+                const error = await this.sendReply(channel_id, content);
+                if (error) BdApi.UI.showToast(`❌ Reply not sent: ${error}`, { type: "error" });
+            }
+        } catch (_) {
+            // Rust app not running; try again next tick.
+        } finally {
+            this.polling = false;
         }
     }
 
@@ -61,6 +106,7 @@ module.exports = class DunstBridge {
             this.sendToRust({
                 author: message.author.global_name || message.author.username || "Someone",
                 content: message.content || "Sent an attachment",
+                channel_id: message.channel_id,
                 avatar: message.author.avatar
                     ? `https://cdn.discordapp.com/avatars/${message.author.id}/${message.author.avatar}.png`
                     : "https://cdn.discordapp.com/embed/avatars/0.png",
@@ -196,10 +242,54 @@ module.exports = class DunstBridge {
             BdApi.UI.showToast("Reel sent. If the player doesn't open, check the error toast.", { type: "info" });
         };
 
+        // Reply tests: check that Discord's send function exists, then send a real message to a
+        // channel by ID (right-click a channel or DM with Developer Mode on, "Copy Channel ID").
+        // Open a different chat first to prove the target doesn't have to be on screen.
+        const checkBtn = document.createElement("button");
+        checkBtn.innerText = "🔍 Check Reply Send Function";
+        checkBtn.className = "bd-button";
+        checkBtn.style.padding = "10px 16px";
+        checkBtn.style.borderRadius = "8px";
+        checkBtn.style.cursor = "pointer";
+        checkBtn.onclick = () => {
+            const actions = this.getMessageActions();
+            if (actions && typeof actions.sendMessage === "function") {
+                BdApi.UI.showToast("✅ sendMessage found, replies from the toast can work", { type: "success" });
+            } else {
+                BdApi.UI.showToast("❌ sendMessage not found, Discord changed its internals", { type: "error" });
+            }
+        };
+
+        const channelInput = document.createElement("input");
+        channelInput.type = "text";
+        channelInput.placeholder = "Channel ID to send the test message to";
+        channelInput.style.padding = "8px 12px";
+        channelInput.style.borderRadius = "8px";
+
+        const replyBtn = document.createElement("button");
+        replyBtn.innerText = "💬 Send Test Reply To Channel ID";
+        replyBtn.className = "bd-button";
+        replyBtn.style.padding = "10px 16px";
+        replyBtn.style.borderRadius = "8px";
+        replyBtn.style.cursor = "pointer";
+        replyBtn.onclick = async () => {
+            const id = channelInput.value.trim();
+            if (!/^\d{15,25}$/.test(id)) {
+                BdApi.UI.showToast("❌ Enter a numeric channel ID first", { type: "error" });
+                return;
+            }
+            const error = await this.sendReply(id, "DunstBridge reply test");
+            if (error) BdApi.UI.showToast(`❌ Send failed: ${error}`, { type: "error" });
+            else BdApi.UI.showToast("✅ Sent. Check that channel.", { type: "success" });
+        };
+
         panel.appendChild(singleBtn);
         panel.appendChild(spamBtn);
         panel.appendChild(ytdlpBtn);
         panel.appendChild(reelBtn);
+        panel.appendChild(checkBtn);
+        panel.appendChild(channelInput);
+        panel.appendChild(replyBtn);
         return panel;
     }
 };  
