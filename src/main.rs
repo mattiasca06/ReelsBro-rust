@@ -528,6 +528,47 @@ fn fetch_latest_ytdlp_version() -> Result<String, String> {
         .ok_or_else(|| "GitHub response had no tag_name".to_string())
 }
 
+const SOUND_URL: &str = "https://www.myinstants.com/media/sounds/what-a-good-boy.mp3";
+const SOUND_FILE: &str = "what-a-good-boy.mp3";
+
+/// Default notification sound: `sounds/what-a-good-boy.mp3` in the working directory (the project folder under `cargo run`).
+fn default_sound_path() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_default().join("sounds").join(SOUND_FILE)
+}
+
+/// A real, non-trivial mp3 (ID3 tag or MPEG frame sync), so an HTML error page saved by mistake is not accepted.
+fn sound_is_valid(path: &std::path::Path) -> bool {
+    match std::fs::read(path) {
+        Ok(b) => b.len() > 1024 && (b.starts_with(b"ID3") || (b[0] == 0xFF && b[1] & 0xE0 == 0xE0)),
+        Err(_) => false,
+    }
+}
+
+/// Makes sure the default sound is on disk, downloading it if not. Returns an error message on failure.
+fn ensure_default_sound() -> Result<(), String> {
+    let path = default_sound_path();
+    if sound_is_valid(&path) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("can't create sounds folder: {}", e))?;
+    let tmp = path.with_extension("part");
+    let out = hidden_command("curl")
+        .args(["-L", "-sS", "--fail", "-m", "30", "-A", "Mozilla/5.0", "-o"])
+        .arg(&tmp)
+        .arg(SOUND_URL)
+        .output()
+        .map_err(|e| format!("curl failed: {}", e))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("download failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    if !sound_is_valid(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("downloaded file is not a valid mp3".to_string());
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("can't save sound: {}", e))
+}
+
 fn version_parts(v: &str) -> Vec<u64> {
     v.split('.').map_while(|p| p.parse::<u64>().ok()).collect()
 }
@@ -1678,6 +1719,25 @@ fn main() {
     // Picture cards under the toast: one small window per picture, created when a message has pictures.
     let mut media = MediaGrid::default();
 
+    // Assert the notification sound is downloaded (fetch it if not); tell the user via a toast if that fails.
+    let proxy_sound = proxy.clone();
+    thread::spawn(move || {
+        if let Err(e) = ensure_default_sound() {
+            let _ = proxy_sound.send_event(CustomEvent::ShowToast(ToastPayload {
+                author: "Sound".to_string(),
+                content: format!("❌ Notification sound unavailable: {}", e),
+                avatar: "https://cdn.discordapp.com/embed/avatars/0.png".to_string(),
+                sound_path: None,
+                accent_color: Some("#f38ba8".to_string()),
+                position: None,
+                test: true,
+                channel_id: None,
+                media: Vec::new(),
+                media_update: false,
+            }));
+        }
+    });
+
     #[cfg(feature = "debug-hooks")]
     hooks::install(proxy.clone());
 
@@ -1801,8 +1861,10 @@ fn main() {
                 let mut reading_time_ms = (4500 + (total_chars * 45)).clamp(4500, 20000) as u64;
 
                 if !item_mute.is_checked() {
-                    if let Some(ref sound) = payload.sound_path {
-                        let sound_clone = sound.clone();
+                    // A sound path sent by the plugin wins if the file exists; otherwise the default sound.
+                    let custom = payload.sound_path.as_ref().map(std::path::PathBuf::from).filter(|p| p.is_file());
+                    let default = Some(default_sound_path()).filter(|p| sound_is_valid(p));
+                    if let Some(sound_clone) = custom.or(default) {
                         thread::spawn(move || {
                             if let Ok(file) = File::open(&sound_clone) {
                                 if let Ok((_stream, handle)) = rodio::OutputStream::try_default() {

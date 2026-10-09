@@ -7,7 +7,9 @@
 
 module.exports = class DunstBridge {
     serverUrl = "http://127.0.0.1:8999";
-    soundPath = "C:\\Users\\matti\\Documents\\cosa.mp3";
+    // Optional override: full path to an audio file. Leave null to use the Rust app's default sound
+    // (sounds/what-a-good-boy.mp3, which the app downloads by itself if it is missing).
+    soundPath = null;
     testReelUrl = "https://www.instagram.com/reel/DeP0ro-Az15/?utm_source=ig_web_copy_link&dlrf=NTc4MTIwNjQ2YQ==";
 
     start() {
