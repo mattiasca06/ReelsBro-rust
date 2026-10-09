@@ -1,5 +1,8 @@
 #![windows_subsystem = "windows"]
 
+#[cfg(feature = "debug-hooks")]
+mod hooks;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -1341,6 +1344,9 @@ fn main() {
         .with_html(settings_html)
         .build(&settings_window)
         .unwrap();
+
+    #[cfg(feature = "debug-hooks")]
+    hooks::install(proxy.clone());
 
     let notification_counter = Arc::new(AtomicUsize::new(0));
     let mut last_author: Option<String> = None;
