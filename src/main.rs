@@ -88,10 +88,9 @@ enum CustomEvent {
     ReplyActive(bool),
     /// Media that arrived after the toast was shown (link embeds).
     AttachMedia(ToastPayload),
-    /// Open an image (url, kind) in the zoomable viewer window.
-    ViewMedia(String, String),
-    ViewerClose,
-    /// The media window finished showing its queue.
+    /// A media card was clicked: open its image/gif in the browser.
+    OpenMedia(String),
+    /// The media window's timer ran out.
     MediaDone,
     Menu(tray_icon::menu::MenuId),
 }
@@ -116,7 +115,11 @@ fn create_purple_icon() -> Icon {
 // so window and contents always scale together.
 const TOAST_BASE: (f64, f64) = (980.0, 300.0);
 const REEL_BASE: (f64, f64) = (380.0, 670.0);
-const MEDIA_BASE: (f64, f64) = (640.0, 360.0); // 16:9 picture window under the toast
+const MEDIA_GAP: f64 = 12.0;
+const MEDIA_MAX: usize = 6; // 3 columns x 2 rows
+const MEDIA_COLS: usize = 3;
+/// Number of cards the media window currently holds; decides its size (see `media_layout`).
+static MEDIA_COUNT: AtomicUsize = AtomicUsize::new(0);
 const EDGE_MARGIN: f64 = 24.0;
 const TOP_MARGIN: f64 = 35.0;
 
@@ -187,12 +190,80 @@ fn place_toast(toast_window: &Window, toast_webview: &wry::WebView, reel_window:
     apply_layout(toast_window, toast_webview, TOAST_BASE, percent, Anchor::TopCenter(reel_left));
 }
 
-/// Places the media window directly under the toast.
+/// Card size and total window size (100% scale, logical px) for `n` cards: one card is as wide as the
+/// toast; several are smaller 16:9 cards in a grid of up to 3 columns.
+fn media_layout(n: usize) -> ((f64, f64), (f64, f64)) {
+    if n <= 1 {
+        return ((TOAST_BASE.0, 551.0), (TOAST_BASE.0, 551.0));
+    }
+    let cell = (640.0, 360.0);
+    let cols = n.min(MEDIA_COLS) as f64;
+    let rows = ((n + MEDIA_COLS - 1) / MEDIA_COLS) as f64;
+    ((cols * cell.0 + (cols - 1.0) * MEDIA_GAP, rows * cell.1 + (rows - 1.0) * MEDIA_GAP), cell)
+}
+
+/// Sizes the media window for its current cards and places it directly under the toast.
 fn place_media(media_window: &Window, media_webview: &wry::WebView, toast_window: &Window, percent: f64) {
     if let Ok(pos) = toast_window.outer_position() {
         let size = toast_window.outer_size();
         let anchor = Anchor::Below { center_x: pos.x + size.width as i32 / 2, top: pos.y + size.height as i32 };
-        apply_layout(media_window, media_webview, MEDIA_BASE, percent, anchor);
+        let (base, _) = media_layout(MEDIA_COUNT.load(Ordering::Relaxed));
+        apply_layout(media_window, media_webview, base, percent, anchor);
+    }
+}
+
+/// The picture cards currently in the media window. They all share one timer: 5s plus 3s per extra card.
+#[derive(Default)]
+struct MediaState {
+    cards: Vec<serde_json::Value>,
+    /// Pictures that did not fit in the grid.
+    overflow: usize,
+}
+
+impl MediaState {
+    /// Adds the payload's pictures (skipping duplicates). Returns whether the window needs refreshing.
+    fn add(&mut self, payload: &ToastPayload, accent: &str) -> bool {
+        let mut changed = false;
+        for m in &payload.media {
+            if self.cards.iter().any(|c| c["url"] == m.url.as_str()) {
+                continue;
+            }
+            if self.cards.len() >= MEDIA_MAX {
+                self.overflow += 1;
+            } else {
+                self.cards.push(serde_json::json!({
+                    "url": m.url, "kind": m.kind, "author": payload.author, "accent": accent,
+                }));
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn clear(&mut self) {
+        self.cards.clear();
+        self.overflow = 0;
+        MEDIA_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    /// Resizes the window for the current cards, redraws them, restarts the shared timer and shows it.
+    fn show(&self, window: &Window, webview: &wry::WebView, toast_window: &Window, percent: f64) {
+        MEDIA_COUNT.store(self.cards.len(), Ordering::Relaxed);
+        place_media(window, webview, toast_window, percent);
+        let (_, cell) = media_layout(self.cards.len());
+        let duration_ms = 5000 + 3000 * self.cards.len().saturating_sub(1);
+        let js = format!(
+            "showMedia({}, {}, {}, {}, {}, {});",
+            serde_json::Value::Array(self.cards.clone()),
+            cell.0,
+            cell.1,
+            MEDIA_GAP,
+            duration_ms,
+            self.overflow
+        );
+        let _ = webview.evaluate_script(&js);
+        window.set_visible(true);
+        window.set_always_on_top(true);
     }
 }
 
@@ -379,15 +450,6 @@ fn check_ytdlp() -> serde_json::Value {
             "error": e,
         }),
     }
-}
-
-/// Queues the payload's images/gifs in the media window. Returns whether anything was queued.
-fn enqueue_media(media_webview: &wry::WebView, payload: &ToastPayload, accent: &str) -> bool {
-    for m in &payload.media {
-        let js = format!("addMedia({:?}, {:?}, {:?}, {:?});", m.url, m.kind, payload.author, accent);
-        let _ = media_webview.evaluate_script(&js);
-    }
-    !payload.media.is_empty()
 }
 
 /// Reads one HTTP request completely. A single `read` can return just the headers (the body often
@@ -1498,30 +1560,10 @@ fn main() {
         .build(&settings_window)
         .unwrap();
 
-    // Image viewer: one reusable window, shown when a toast image is clicked.
-    let viewer_window = WindowBuilder::new()
-        .with_title("Image Viewer")
-        .with_inner_size(LogicalSize::new(1100.0, 780.0))
-        .with_always_on_top(true)
-        .with_visible(false)
-        .build(&event_loop)
-        .unwrap();
-    let viewer_id = viewer_window.id();
-    let proxy_viewer = proxy.clone();
-    let viewer_webview = WebViewBuilder::new()
-        .with_ipc_handler(move |req| {
-            if req.body() == "close" {
-                let _ = proxy_viewer.send_event(CustomEvent::ViewerClose);
-            }
-        })
-        .with_html(include_str!("viewer.html"))
-        .build(&viewer_window)
-        .unwrap();
-
-    // Media window: 16:9 picture window under the toast; queues images/gifs and shows them in turn.
+    // Media window: sits under the toast and shows the message's images/gifs as a grid of cards.
     let media_window = WindowBuilder::new()
         .with_title("DunstMedia")
-        .with_inner_size(LogicalSize::new(MEDIA_BASE.0, MEDIA_BASE.1))
+        .with_inner_size(LogicalSize::new(TOAST_BASE.0, 551.0))
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top(true)
@@ -1537,16 +1579,14 @@ fn main() {
             let body = req.body();
             if body == "media_done" {
                 let _ = proxy_media.send_event(CustomEvent::MediaDone);
-            } else if let Some(v) = body.strip_prefix("view_media:") {
-                if let Some((kind, url)) = v.split_once('|') {
-                    let _ = proxy_media.send_event(CustomEvent::ViewMedia(url.to_string(), kind.to_string()));
-                }
+            } else if let Some(url) = body.strip_prefix("open_media:") {
+                let _ = proxy_media.send_event(CustomEvent::OpenMedia(url.to_string()));
             }
         })
         .with_html(include_str!("media.html"))
         .build(&media_window)
         .unwrap();
-    place_media(&media_window, &media_webview, &toast_window, settings.toast_scale);
+    let mut media = MediaState::default();
 
     #[cfg(feature = "debug-hooks")]
     hooks::install(proxy.clone());
@@ -1623,12 +1663,16 @@ fn main() {
                         reel_window.set_visible(true);
                         reel_window.set_always_on_top(true);
                     }
-                    let _ = media_webview.evaluate_script("previewMedia();");
+                    media.clear();
+                    MEDIA_COUNT.store(1, Ordering::Relaxed);
                     media_window.set_visible(true);
                     media_window.set_always_on_top(true);
                     place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
+                    let (_, cell) = media_layout(1);
+                    let _ = media_webview.evaluate_script(&format!("previewMedia({}, {}, {});", cell.0, cell.1, MEDIA_GAP));
                 } else {
                     toast_window.set_visible(false);
+                    media.clear();
                     media_window.set_visible(false);
                     let _ = media_webview.evaluate_script("clearMedia();");
                     if active_reel.is_none() {
@@ -1695,10 +1739,8 @@ fn main() {
                 toast_window.set_visible(true);
                 toast_window.set_always_on_top(true);
 
-                if enqueue_media(&media_webview, &payload, &accent) {
-                    place_media(&media_window, &media_webview, &toast_window, settings.toast_scale);
-                    media_window.set_visible(true);
-                    media_window.set_always_on_top(true);
+                if !preview_active && media.add(&payload, &accent) {
+                    media.show(&media_window, &media_webview, &toast_window, settings.toast_scale);
                 }
 
                 let current_id = notification_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1721,26 +1763,21 @@ fn main() {
                     return;
                 }
                 let accent = payload.accent_color.clone().unwrap_or_else(|| "#cba6f7".to_string());
-                if enqueue_media(&media_webview, &payload, &accent) {
-                    place_media(&media_window, &media_webview, &toast_window, settings.toast_scale);
-                    media_window.set_visible(true);
-                    media_window.set_always_on_top(true);
+                if !preview_active && media.add(&payload, &accent) {
+                    media.show(&media_window, &media_webview, &toast_window, settings.toast_scale);
                 }
             },
             Event::UserEvent(CustomEvent::MediaDone) => {
                 if !preview_active {
+                    media.clear();
                     media_window.set_visible(false);
                     let _ = media_webview.evaluate_script("clearMedia();");
                 }
             },
-            Event::UserEvent(CustomEvent::ViewMedia(url, kind)) => {
-                let _ = viewer_webview.evaluate_script(&format!("showMedia({:?}, {:?});", url, kind));
-                viewer_window.set_visible(true);
-                viewer_window.set_focus();
-            },
-            Event::UserEvent(CustomEvent::ViewerClose) => {
-                viewer_window.set_visible(false);
-                let _ = viewer_webview.evaluate_script("document.getElementById('stage').innerHTML = '';");
+            Event::UserEvent(CustomEvent::OpenMedia(url)) => {
+                if url.starts_with("http") && open_links_enabled.load(Ordering::Relaxed) {
+                    let _ = open::that(url);
+                }
             },
             Event::UserEvent(CustomEvent::ReplyActive(active)) => {
                 reply_active = active;
@@ -1812,8 +1849,6 @@ fn main() {
                     let _ = settings_webview.evaluate_script("setPreview(false);");
                     let _ = proxy.send_event(CustomEvent::SetPreview(false));
                     save_settings(&settings);
-                } else if window_id == viewer_id {
-                    let _ = proxy.send_event(CustomEvent::ViewerClose);
                 } else {
                     *control_flow = ControlFlow::Exit;
                 }

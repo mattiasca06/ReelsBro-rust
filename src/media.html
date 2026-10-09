@@ -6,46 +6,36 @@
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { background: transparent !important; width: 100vw; height: 100vh; overflow: hidden;
         font-family: 'JetBrains Mono', 'Segoe UI', sans-serif; user-select: none; }
-    #card { position: relative; width: 100%; height: 100%; overflow: hidden; background: rgba(17, 17, 27, 0.96);
-        border: 3px solid #cba6f7; border-radius: 18px; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.8); }
-    #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
-    #stage img, #stage video { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; }
-    #bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: space-between;
-        padding: 26px 16px 12px; color: #cdd6f4; font-size: 15px; font-weight: 700;
-        background: linear-gradient(to top, rgba(17, 17, 27, 0.9), rgba(17, 17, 27, 0)); pointer-events: none; }
-    #nav { display: none; align-items: center; gap: 10px; pointer-events: auto; }
-    #nav button { background: rgba(255, 255, 255, 0.12); border: none; color: #cdd6f4; width: 30px; height: 30px;
-        border-radius: 50%; font-size: 18px; line-height: 1; cursor: pointer; }
-    #nav button:hover { background: rgba(255, 255, 255, 0.25); }
-    #count { min-width: 48px; text-align: center; font-weight: 600; }
+    #grid { display: flex; flex-wrap: wrap; justify-content: center; align-content: flex-start;
+        width: 100vw; height: 100vh; gap: var(--gap, 12px); }
+    .card { position: relative; flex: none; width: var(--cw); height: var(--ch); overflow: hidden; cursor: pointer;
+        background: rgba(17, 17, 27, 0.96); border: 3px solid var(--accent, #cba6f7); border-radius: 18px;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.8); animation: popIn 0.2s cubic-bezier(0.16, 1, 0.3, 1); }
+    .card img, .card video { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+    .card .fail { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+        color: rgba(205, 214, 244, 0.6); font-size: 16px; }
+    .who { position: absolute; left: 14px; bottom: 16px; padding: 4px 12px; border-radius: 999px; font-size: 14px;
+        font-weight: 700; color: #cdd6f4; background: rgba(17, 17, 27, 0.75); pointer-events: none; }
+    .more { position: absolute; right: 14px; top: 12px; padding: 4px 12px; border-radius: 999px; font-size: 14px;
+        font-weight: 700; color: #11111b; background: var(--accent, #cba6f7); pointer-events: none; }
+    /* Countdown: the bar drains from right to left over the time the pictures stay up. */
+    .bar { position: absolute; left: 0; bottom: 0; height: 5px; width: 100%; background: var(--accent, #cba6f7);
+        transform-origin: left center; animation: drain var(--dur) linear forwards; pointer-events: none; }
+    @keyframes drain { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+    @keyframes popIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 </style>
 </head>
 <body>
-<div id="card">
-    <div id="stage"></div>
-    <div id="bar">
-        <span id="who"></span>
-        <span id="nav"><button id="prev">&#8249;</button><span id="count"></span><button id="next">&#8250;</button></span>
-    </div>
-</div>
+<div id="grid"></div>
 <script>
-    const card = document.getElementById('card');
-    const stage = document.getElementById('stage');
-    let items = [], idx = 0, timer = null, hovered = false, previewing = false;
+    const grid = document.getElementById('grid');
+    const cards = new Map(); // url -> card element
+    let timer = null;
 
-    function chrome() {
-        const it = items[idx];
-        if (!it) return;
-        document.getElementById('who').textContent = '@' + it.author;
-        document.getElementById('count').textContent = (idx + 1) + ' / ' + items.length;
-        document.getElementById('nav').style.display = items.length > 1 ? 'flex' : 'none';
-        card.style.borderColor = it.accent;
-    }
-
-    function render() {
-        const it = items[idx];
-        if (!it) return;
-        stage.innerHTML = '';
+    function makeCard(it) {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.style.setProperty('--accent', it.accent);
         let el;
         if (it.kind === 'gifv') {
             el = document.createElement('video');
@@ -54,63 +44,71 @@
             el = document.createElement('img');
         }
         el.draggable = false;
-        el.addEventListener('error', () => drop(items.indexOf(it)));
-        el.addEventListener('click', () => {
-            if (!previewing) window.ipc.postMessage('view_media:' + it.kind + '|' + it.url);
+        el.addEventListener('error', () => {
+            el.remove();
+            const fail = document.createElement('div');
+            fail.className = 'fail';
+            fail.textContent = "Couldn't load picture";
+            card.prepend(fail);
         });
         el.src = it.url;
-        stage.appendChild(el);
-        chrome();
-        schedule();
+        card.appendChild(el);
+        const who = document.createElement('div');
+        who.className = 'who';
+        who.textContent = '@' + it.author;
+        card.appendChild(who);
+        // Click opens the picture in the browser (not for the settings preview).
+        card.addEventListener('click', () => {
+            if (/^https?:/.test(it.url)) window.ipc.postMessage('open_media:' + it.url);
+        });
+        return card;
     }
 
-    // Auto-advance through the queue; after the last item has been up for a while, ask to be hidden.
-    // Hovering pauses everything so a picture can be looked at (or clicked) in peace.
-    function schedule() {
+    // Draws all cards, restarts the shared countdown (durationMs 0 = no timer, used by the preview)
+    // and asks to be hidden when it runs out. Cards already on screen are kept so gifs don't restart.
+    function showMedia(items, cw, ch, gap, durationMs, extra) {
+        grid.style.setProperty('--cw', cw + 'px');
+        grid.style.setProperty('--ch', ch + 'px');
+        grid.style.setProperty('--gap', gap + 'px');
+        for (const it of items) {
+            if (!cards.has(it.url)) {
+                const card = makeCard(it);
+                cards.set(it.url, card);
+                grid.appendChild(card);
+            }
+        }
+        cards.forEach((card) => {
+            card.querySelectorAll('.bar, .more').forEach(n => n.remove());
+            if (durationMs > 0) {
+                const bar = document.createElement('div');
+                bar.className = 'bar';
+                bar.style.setProperty('--dur', durationMs + 'ms');
+                card.appendChild(bar);
+            }
+        });
+        if (extra > 0 && items.length) {
+            const more = document.createElement('div');
+            more.className = 'more';
+            more.textContent = '+' + extra + ' more';
+            cards.get(items[items.length - 1].url).appendChild(more);
+        }
         clearTimeout(timer);
-        if (previewing || hovered || !items.length) return;
-        const last = idx >= items.length - 1;
-        timer = setTimeout(() => {
-            if (!last) { idx++; render(); }
-            else window.ipc.postMessage('media_done');
-        }, last ? 6000 : 4000);
-    }
-
-    // An item that failed to load (expired link, blocked host) is skipped.
-    function drop(i) {
-        if (i < 0) return;
-        items.splice(i, 1);
-        if (!items.length) { window.ipc.postMessage('media_done'); return; }
-        idx = Math.min(idx, items.length - 1);
-        render();
-    }
-
-    function addMedia(url, kind, author, accent) {
-        items.push({ url, kind, author, accent });
-        if (items.length === 1) { idx = 0; render(); }
-        else { chrome(); schedule(); }
+        if (durationMs > 0) timer = setTimeout(() => window.ipc.postMessage('media_done'), durationMs);
     }
 
     function clearMedia() {
         clearTimeout(timer);
-        items = []; idx = 0; previewing = false;
-        stage.innerHTML = '';
+        cards.clear();
+        grid.innerHTML = '';
     }
 
-    function previewMedia() {
+    function previewMedia(cw, ch, gap) {
         clearMedia();
-        previewing = true;
         const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
             + '<stop offset="0" stop-color="#cba6f7"/><stop offset="1" stop-color="#89b4fa"/></linearGradient></defs>'
-            + '<rect width="1280" height="720" fill="url(#g)"/><text x="640" y="380" font-size="64" font-family="Segoe UI" fill="#11111b" text-anchor="middle">Image preview</text></svg>';
-        items = [{ url: 'data:image/svg+xml;utf8,' + encodeURIComponent(svg), kind: 'image', author: 'Preview', accent: '#cba6f7' }];
-        render();
+            + '<rect width="1280" height="720" fill="url(#g)"/><text x="640" y="400" font-size="72" font-family="Segoe UI" fill="#11111b" text-anchor="middle">Image preview</text></svg>';
+        showMedia([{ url: 'data:image/svg+xml;utf8,' + encodeURIComponent(svg), kind: 'image', author: 'Preview', accent: '#cba6f7' }], cw, ch, gap, 0, 0);
     }
-
-    card.addEventListener('mouseenter', () => { hovered = true; clearTimeout(timer); });
-    card.addEventListener('mouseleave', () => { hovered = false; schedule(); });
-    document.getElementById('prev').addEventListener('click', () => { idx = (idx - 1 + items.length) % items.length; render(); });
-    document.getElementById('next').addEventListener('click', () => { idx = (idx + 1) % items.length; render(); });
 </script>
 </body>
 </html>
