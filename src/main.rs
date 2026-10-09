@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -42,12 +42,19 @@ struct ToastPayload {
     test: bool,
     /// Discord channel the message came from; lets the toast reply back to it.
     channel_id: Option<String>,
-    /// First image/gif of the message. `media_kind` is "image" or "gifv" (a looping muted clip).
-    media_url: Option<String>,
-    media_kind: Option<String>,
+    /// Images and gifs of the message, shown in the media window.
+    #[serde(default)]
+    media: Vec<MediaItem>,
     /// Discord builds link embeds after the message arrives; the plugin then re-sends just the media.
     #[serde(default)]
     media_update: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct MediaItem {
+    url: String,
+    /// "image", or "gifv" (a gif delivered as a looping muted clip).
+    kind: String,
 }
 
 /// Replies typed into the toast, waiting for the plugin to pick them up via `GET /outbox`.
@@ -84,6 +91,8 @@ enum CustomEvent {
     /// Open an image (url, kind) in the zoomable viewer window.
     ViewMedia(String, String),
     ViewerClose,
+    /// The media window finished showing its queue.
+    MediaDone,
     Menu(tray_icon::menu::MenuId),
 }
 
@@ -107,6 +116,7 @@ fn create_purple_icon() -> Icon {
 // so window and contents always scale together.
 const TOAST_BASE: (f64, f64) = (980.0, 300.0);
 const REEL_BASE: (f64, f64) = (380.0, 670.0);
+const MEDIA_BASE: (f64, f64) = (640.0, 360.0); // 16:9 picture window under the toast
 const EDGE_MARGIN: f64 = 24.0;
 const TOP_MARGIN: f64 = 35.0;
 
@@ -163,6 +173,8 @@ enum Anchor {
     /// Centered on the monitor; if `Some(reel_left)` (physical px), pushed left to stay clear of the reel player.
     TopCenter(Option<i32>),
     TopRight,
+    /// Horizontally centered on `center_x`, starting just under `top` (both physical px).
+    Below { center_x: i32, top: i32 },
 }
 
 /// Re-places the toast, pushing it left if the reel player is visible and would overlap it.
@@ -173,6 +185,30 @@ fn place_toast(toast_window: &Window, toast_webview: &wry::WebView, reel_window:
         None
     };
     apply_layout(toast_window, toast_webview, TOAST_BASE, percent, Anchor::TopCenter(reel_left));
+}
+
+/// Places the media window directly under the toast.
+fn place_media(media_window: &Window, media_webview: &wry::WebView, toast_window: &Window, percent: f64) {
+    if let Ok(pos) = toast_window.outer_position() {
+        let size = toast_window.outer_size();
+        let anchor = Anchor::Below { center_x: pos.x + size.width as i32 / 2, top: pos.y + size.height as i32 };
+        apply_layout(media_window, media_webview, MEDIA_BASE, percent, anchor);
+    }
+}
+
+/// Places the toast, then keeps the media window attached under it if it is showing.
+fn place_dunst(
+    toast_window: &Window,
+    toast_webview: &wry::WebView,
+    reel_window: &Window,
+    media_window: &Window,
+    media_webview: &wry::WebView,
+    percent: f64,
+) {
+    place_toast(toast_window, toast_webview, reel_window, percent);
+    if media_window.is_visible() {
+        place_media(media_window, media_webview, toast_window, percent);
+    }
 }
 
 /// Sizes and positions `window` on its monitor in physical pixels (DPI-aware), capping the scale so it
@@ -191,8 +227,11 @@ fn apply_layout(window: &Window, webview: &wry::WebView, base: (f64, f64), perce
     let margin = EDGE_MARGIN * dpi;
     let top = TOP_MARGIN * dpi;
     let max_by_w = (mw - 2.0 * margin) / (base.0 * dpi);
-    let max_by_h = (mh - top - margin) / (base.1 * dpi);
     let gap = 12.0 * dpi;
+    let max_by_h = match anchor {
+        Anchor::Below { top: below, .. } => (my + mh - below as f64 - gap - margin) / (base.1 * dpi),
+        _ => (mh - top - margin) / (base.1 * dpi),
+    };
     // If the reel is in the way, the toast may use only the space to its left (shrinks only when it can't fit at all).
     let max_by_w = match anchor {
         Anchor::TopCenter(Some(reel_left)) => {
@@ -211,8 +250,13 @@ fn apply_layout(window: &Window, webview: &wry::WebView, base: (f64, f64), perce
             centered.min(reel_left as f64 - gap - w).max(mx + margin)
         }
         Anchor::TopRight => mx + mw - w - margin,
+        Anchor::Below { center_x, .. } => (center_x as f64 - w / 2.0).max(mx + margin).min(mx + mw - w - margin),
     };
-    let (px, py) = (x.round() as i32, (my + top).round() as i32);
+    let y = match anchor {
+        Anchor::Below { top: below, .. } => below as f64 + gap,
+        _ => my + top,
+    };
+    let (px, py) = (x.round() as i32, y.round() as i32);
     // tao's set_inner_size is silently ignored for these undecorated windows, so go straight to Win32.
     #[cfg(target_os = "windows")]
     unsafe {
@@ -335,6 +379,41 @@ fn check_ytdlp() -> serde_json::Value {
             "error": e,
         }),
     }
+}
+
+/// Queues the payload's images/gifs in the media window. Returns whether anything was queued.
+fn enqueue_media(media_webview: &wry::WebView, payload: &ToastPayload, accent: &str) -> bool {
+    for m in &payload.media {
+        let js = format!("addMedia({:?}, {:?}, {:?}, {:?});", m.url, m.kind, payload.author, accent);
+        let _ = media_webview.evaluate_script(&js);
+    }
+    !payload.media.is_empty()
+}
+
+/// Reads one HTTP request completely. A single `read` can return just the headers (the body often
+/// arrives in a later TCP segment), so keep reading until Content-Length bytes of body are in.
+fn read_request(stream: &mut TcpStream) -> String {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut data: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => data.extend_from_slice(&buf[..n]),
+        }
+        if let Some(head_end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&data[..head_end]).to_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if data.len() >= head_end + 4 + body_len {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&data).into_owned()
 }
 
 fn extract_reel_urls(text: &str) -> Vec<String> {
@@ -482,24 +561,6 @@ fn main() {
             .reply input:focus { border-color: var(--accent, #cba6f7); }
             .reply input::placeholder { color: rgba(205, 214, 244, 0.45); }
 
-            .msg-media {
-                flex-shrink: 0;
-                display: flex;
-                justify-content: flex-start;
-                padding: 8px;
-                background: rgba(255, 255, 255, 0.05);
-                border-left: 3.5px solid var(--accent, #cba6f7);
-                border-radius: 6px 12px 12px 6px;
-                animation: popIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-            }
-            .msg-media img, .msg-media video {
-                max-width: 100%;
-                max-height: 170px;
-                object-fit: contain;
-                border-radius: 8px;
-                cursor: zoom-in;
-            }
-
             .msg-bubble {
                 flex: 1;
                 display: flex;
@@ -601,27 +662,6 @@ fn main() {
                 replyInput.value = '';
             }
 
-            // Shows an image, or a gif delivered as a muted looping clip (kind 'gifv'). Click opens the viewer.
-            function appendMedia(url, kind) {
-                const list = document.getElementById('msg-list');
-                const box = document.createElement('div');
-                box.className = 'msg-media';
-                let el;
-                if (kind === 'gifv') {
-                    el = document.createElement('video');
-                    el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true;
-                } else {
-                    el = document.createElement('img');
-                }
-                el.draggable = false;
-                el.src = url;
-                el.addEventListener('click', () => window.ipc.postMessage('view_media:' + kind + '|' + url));
-                el.addEventListener(kind === 'gifv' ? 'loadeddata' : 'load', () => { list.scrollTop = list.scrollHeight; });
-                box.appendChild(el);
-                list.appendChild(box);
-                list.scrollTop = list.scrollHeight;
-            }
-
             function appendBubble(content, accent) {
                 const list = document.getElementById('msg-list');
                 const bubble = document.createElement('div');
@@ -652,10 +692,6 @@ fn main() {
                 let _ = proxy_toast.send_event(CustomEvent::Reply(text.to_string()));
             } else if let Some(v) = body.strip_prefix("reply_active:") {
                 let _ = proxy_toast.send_event(CustomEvent::ReplyActive(v == "1"));
-            } else if let Some(v) = body.strip_prefix("view_media:") {
-                if let Some((kind, url)) = v.split_once('|') {
-                    let _ = proxy_toast.send_event(CustomEvent::ViewMedia(url.to_string(), kind.to_string()));
-                }
             }
         })
         .with_html(toast_html)
@@ -1482,6 +1518,36 @@ fn main() {
         .build(&viewer_window)
         .unwrap();
 
+    // Media window: 16:9 picture window under the toast; queues images/gifs and shows them in turn.
+    let media_window = WindowBuilder::new()
+        .with_title("DunstMedia")
+        .with_inner_size(LogicalSize::new(MEDIA_BASE.0, MEDIA_BASE.1))
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top(true)
+        .with_resizable(false)
+        .with_visible(false)
+        .build(&event_loop)
+        .unwrap();
+    let proxy_media = proxy.clone();
+    let media_webview = WebViewBuilder::new()
+        .with_transparent(true)
+        .with_background_color((0, 0, 0, 0))
+        .with_ipc_handler(move |req| {
+            let body = req.body();
+            if body == "media_done" {
+                let _ = proxy_media.send_event(CustomEvent::MediaDone);
+            } else if let Some(v) = body.strip_prefix("view_media:") {
+                if let Some((kind, url)) = v.split_once('|') {
+                    let _ = proxy_media.send_event(CustomEvent::ViewMedia(url.to_string(), kind.to_string()));
+                }
+            }
+        })
+        .with_html(include_str!("media.html"))
+        .build(&media_window)
+        .unwrap();
+    place_media(&media_window, &media_webview, &toast_window, settings.toast_scale);
+
     #[cfg(feature = "debug-hooks")]
     hooks::install(proxy.clone());
 
@@ -1527,12 +1593,12 @@ fn main() {
             },
             Event::UserEvent(CustomEvent::SetToastScale(p)) => {
                 settings.toast_scale = p;
-                place_toast(&toast_window, &toast_webview, &reel_window, p);
+                place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, p);
             },
             Event::UserEvent(CustomEvent::SetReelScale(p)) => {
                 settings.reel_scale = p;
                 apply_layout(&reel_window, &reel_webview, REEL_BASE, p, Anchor::TopRight);
-                place_toast(&toast_window, &toast_webview, &reel_window, settings.toast_scale);
+                place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
             },
             Event::UserEvent(CustomEvent::SetTheme(t)) => {
                 settings_window.set_theme(theme_from_str(&t));
@@ -1557,14 +1623,19 @@ fn main() {
                         reel_window.set_visible(true);
                         reel_window.set_always_on_top(true);
                     }
-                    place_toast(&toast_window, &toast_webview, &reel_window, settings.toast_scale);
+                    let _ = media_webview.evaluate_script("previewMedia();");
+                    media_window.set_visible(true);
+                    media_window.set_always_on_top(true);
+                    place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
                 } else {
                     toast_window.set_visible(false);
+                    media_window.set_visible(false);
+                    let _ = media_webview.evaluate_script("clearMedia();");
                     if active_reel.is_none() {
                         reel_window.set_visible(false);
                         let _ = reel_webview.evaluate_script("stopReel();");
                     }
-                    place_toast(&toast_window, &toast_webview, &reel_window, settings.toast_scale);
+                    place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
                 }
             },
             Event::UserEvent(CustomEvent::ShowToast(payload)) => {
@@ -1594,17 +1665,13 @@ fn main() {
                 if !payload.content.is_empty() {
                     js += &format!("appendBubble({:?}, {:?});", payload.content, accent);
                 }
-                if let Some(url) = &payload.media_url {
-                    js += &format!("appendMedia({:?}, {:?});", url, payload.media_kind.as_deref().unwrap_or("image"));
-                }
                 let _ = toast_webview.evaluate_script(&js);
                 last_time = Some(now);
                 last_channel = payload.channel_id.clone();
                 let _ = toast_webview.evaluate_script(&format!("setReplyEnabled({});", last_channel.is_some()));
 
                 let total_chars: usize = history.iter().map(|m| m.len()).sum();
-                let media_ms = if payload.media_url.is_some() { 3000 } else { 0 };
-                let reading_time_ms = (4500 + (total_chars * 45)).clamp(4500, 20000) as u64 + media_ms;
+                let reading_time_ms = (4500 + (total_chars * 45)).clamp(4500, 20000) as u64;
 
                 if !item_mute.is_checked() {
                     if let Some(ref sound) = payload.sound_path {
@@ -1624,9 +1691,15 @@ fn main() {
                     }
                 }
 
-                place_toast(&toast_window, &toast_webview, &reel_window, settings.toast_scale);
+                place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
                 toast_window.set_visible(true);
                 toast_window.set_always_on_top(true);
+
+                if enqueue_media(&media_webview, &payload, &accent) {
+                    place_media(&media_window, &media_webview, &toast_window, settings.toast_scale);
+                    media_window.set_visible(true);
+                    media_window.set_always_on_top(true);
+                }
 
                 let current_id = notification_counter.fetch_add(1, Ordering::SeqCst) + 1;
                 let proxy_clone = proxy.clone();
@@ -1644,18 +1717,20 @@ fn main() {
                 }
             },
             Event::UserEvent(CustomEvent::AttachMedia(payload)) => {
-                // Only attach if that conversation's toast is still on screen.
-                let same_channel = payload.channel_id.is_some() && payload.channel_id == last_channel;
-                if let (true, true, Some(url)) = (toast_window.is_visible(), same_channel, &payload.media_url) {
-                    let js = format!("appendMedia({:?}, {:?});", url, payload.media_kind.as_deref().unwrap_or("image"));
-                    let _ = toast_webview.evaluate_script(&js);
-                    // Keep the toast up long enough to look at the media.
-                    let id = notification_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                    let proxy_clone = proxy.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(7000));
-                        let _ = proxy_clone.send_event(CustomEvent::HideToast(id));
-                    });
+                if item_dnd.is_checked() {
+                    return;
+                }
+                let accent = payload.accent_color.clone().unwrap_or_else(|| "#cba6f7".to_string());
+                if enqueue_media(&media_webview, &payload, &accent) {
+                    place_media(&media_window, &media_webview, &toast_window, settings.toast_scale);
+                    media_window.set_visible(true);
+                    media_window.set_always_on_top(true);
+                }
+            },
+            Event::UserEvent(CustomEvent::MediaDone) => {
+                if !preview_active {
+                    media_window.set_visible(false);
+                    let _ = media_webview.evaluate_script("clearMedia();");
                 }
             },
             Event::UserEvent(CustomEvent::ViewMedia(url, kind)) => {
@@ -1703,7 +1778,7 @@ fn main() {
                     let _ = reel_webview.evaluate_script(&js);
                     reel_window.set_visible(true);
                     reel_window.set_always_on_top(true);
-                    place_toast(&toast_window, &toast_webview, &reel_window, settings.toast_scale);
+                    place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
                 } else {
                     reel_queue.push_back(item);
                     let js = format!("updateQueueCount({});", reel_queue.len());
@@ -1724,7 +1799,7 @@ fn main() {
                     active_reel = None;
                     reel_window.set_visible(false);
                     let _ = reel_webview.evaluate_script("stopReel();");
-                    place_toast(&toast_window, &toast_webview, &reel_window, settings.toast_scale);
+                    place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
                 }
             },
             Event::UserEvent(CustomEvent::ClearReelQueue) => {
@@ -1754,9 +1829,8 @@ fn start_server(proxy: EventLoopProxy<CustomEvent>, hide_toast_if_reel: Arc<Atom
 
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
-                let mut buffer = [0u8; 8192];
-                if let Ok(bytes_read) = stream.read(&mut buffer) {
-                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                {
+                    let request = read_request(&mut stream);
 
                     if request.starts_with("GET /health/ytdlp") {
                         let body = check_ytdlp().to_string();
@@ -1840,8 +1914,7 @@ fn start_server(proxy: EventLoopProxy<CustomEvent>, hide_toast_if_reel: Arc<Atom
                                             position: None,
                                             test: true,
                                             channel_id: None,
-                                            media_url: None,
-                                            media_kind: None,
+                                            media: Vec::new(),
                                             media_update: false,
                                         }));
                                     }

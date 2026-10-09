@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { background: transparent !important; width: 100vw; height: 100vh; overflow: hidden;
+        font-family: 'JetBrains Mono', 'Segoe UI', sans-serif; user-select: none; }
+    #card { position: relative; width: 100%; height: 100%; overflow: hidden; background: rgba(17, 17, 27, 0.96);
+        border: 3px solid #cba6f7; border-radius: 18px; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.8); }
+    #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+    #stage img, #stage video { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; }
+    #bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: space-between;
+        padding: 26px 16px 12px; color: #cdd6f4; font-size: 15px; font-weight: 700;
+        background: linear-gradient(to top, rgba(17, 17, 27, 0.9), rgba(17, 17, 27, 0)); pointer-events: none; }
+    #nav { display: none; align-items: center; gap: 10px; pointer-events: auto; }
+    #nav button { background: rgba(255, 255, 255, 0.12); border: none; color: #cdd6f4; width: 30px; height: 30px;
+        border-radius: 50%; font-size: 18px; line-height: 1; cursor: pointer; }
+    #nav button:hover { background: rgba(255, 255, 255, 0.25); }
+    #count { min-width: 48px; text-align: center; font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="card">
+    <div id="stage"></div>
+    <div id="bar">
+        <span id="who"></span>
+        <span id="nav"><button id="prev">&#8249;</button><span id="count"></span><button id="next">&#8250;</button></span>
+    </div>
+</div>
+<script>
+    const card = document.getElementById('card');
+    const stage = document.getElementById('stage');
+    let items = [], idx = 0, timer = null, hovered = false, previewing = false;
+
+    function chrome() {
+        const it = items[idx];
+        if (!it) return;
+        document.getElementById('who').textContent = '@' + it.author;
+        document.getElementById('count').textContent = (idx + 1) + ' / ' + items.length;
+        document.getElementById('nav').style.display = items.length > 1 ? 'flex' : 'none';
+        card.style.borderColor = it.accent;
+    }
+
+    function render() {
+        const it = items[idx];
+        if (!it) return;
+        stage.innerHTML = '';
+        let el;
+        if (it.kind === 'gifv') {
+            el = document.createElement('video');
+            el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true;
+        } else {
+            el = document.createElement('img');
+        }
+        el.draggable = false;
+        el.addEventListener('error', () => drop(items.indexOf(it)));
+        el.addEventListener('click', () => {
+            if (!previewing) window.ipc.postMessage('view_media:' + it.kind + '|' + it.url);
+        });
+        el.src = it.url;
+        stage.appendChild(el);
+        chrome();
+        schedule();
+    }
+
+    // Auto-advance through the queue; after the last item has been up for a while, ask to be hidden.
+    // Hovering pauses everything so a picture can be looked at (or clicked) in peace.
+    function schedule() {
+        clearTimeout(timer);
+        if (previewing || hovered || !items.length) return;
+        const last = idx >= items.length - 1;
+        timer = setTimeout(() => {
+            if (!last) { idx++; render(); }
+            else window.ipc.postMessage('media_done');
+        }, last ? 6000 : 4000);
+    }
+
+    // An item that failed to load (expired link, blocked host) is skipped.
+    function drop(i) {
+        if (i < 0) return;
+        items.splice(i, 1);
+        if (!items.length) { window.ipc.postMessage('media_done'); return; }
+        idx = Math.min(idx, items.length - 1);
+        render();
+    }
+
+    function addMedia(url, kind, author, accent) {
+        items.push({ url, kind, author, accent });
+        if (items.length === 1) { idx = 0; render(); }
+        else { chrome(); schedule(); }
+    }
+
+    function clearMedia() {
+        clearTimeout(timer);
+        items = []; idx = 0; previewing = false;
+        stage.innerHTML = '';
+    }
+
+    function previewMedia() {
+        clearMedia();
+        previewing = true;
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+            + '<stop offset="0" stop-color="#cba6f7"/><stop offset="1" stop-color="#89b4fa"/></linearGradient></defs>'
+            + '<rect width="1280" height="720" fill="url(#g)"/><text x="640" y="380" font-size="64" font-family="Segoe UI" fill="#11111b" text-anchor="middle">Image preview</text></svg>';
+        items = [{ url: 'data:image/svg+xml;utf8,' + encodeURIComponent(svg), kind: 'image', author: 'Preview', accent: '#cba6f7' }];
+        render();
+    }
+
+    card.addEventListener('mouseenter', () => { hovered = true; clearTimeout(timer); });
+    card.addEventListener('mouseleave', () => { hovered = false; schedule(); });
+    document.getElementById('prev').addEventListener('click', () => { idx = (idx - 1 + items.length) % items.length; render(); });
+    document.getElementById('next').addEventListener('click', () => { idx = (idx + 1) % items.length; render(); });
+</script>
+</body>
+</html>

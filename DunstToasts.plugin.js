@@ -123,41 +123,38 @@ module.exports = class DunstBridge {
             .replace(/<a?:(\w+):\d+>/g, ":$1:");
     }
 
-    // First image or gif of a message: an uploaded image, an image link, or a gif link (Tenor, Klipy,
-    // Giphy...). Gif embeds are delivered by Discord as a looping muted clip ("gifv"). Plain videos
-    // are ignored. Returns {url, kind} or null.
+    // Every image or gif of a message (uploads, image links, gif links from Tenor, Klipy, Giphy...),
+    // without duplicates, at most MAX_MEDIA. Gif embeds are delivered by Discord as a looping muted clip
+    // ("gifv"). Plain videos are ignored. Returns [{url, kind}].
     extractMedia(message) {
+        const MAX_MEDIA = 10;
+        const found = new Map();
+        const add = (url, kind) => { if (url && !found.has(url)) found.set(url, { url, kind }); };
+
         for (const a of message.attachments || []) {
             if (a.content_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(a.filename || "")) {
-                return { url: a.url, kind: "image" };
+                add(a.url, "image");
             }
         }
         for (const e of message.embeds || []) {
             const provider = (e.provider?.name || "").toLowerCase();
             const isGifSite = ["tenor", "giphy", "klipy"].includes(provider);
-            if ((e.type === "gifv" || isGifSite) && e.video?.url) return { url: e.video.url, kind: "gifv" };
-            if (e.type === "image") return { url: e.thumbnail?.url || e.url, kind: "image" };
-            if (e.type !== "video" && (e.image?.url || e.thumbnail?.url)) {
-                return { url: e.image?.url || e.thumbnail.url, kind: "image" };
-            }
+            if ((e.type === "gifv" || isGifSite) && e.video?.url) add(e.video.url, "gifv");
+            else if (e.type === "image") add(e.thumbnail?.url || e.url, "image");
+            else if (e.type !== "video") add(e.image?.url || e.thumbnail?.url, "image");
         }
-        return null;
+        return [...found.values()].slice(0, MAX_MEDIA);
     }
 
-    // Link embeds are built by Discord after the message arrives, so they show up in MESSAGE_UPDATE.
+    // Link embeds are built by Discord after the message arrives, and one at a time, so they show up
+    // as one or more MESSAGE_UPDATEs. Only media not sent yet is forwarded.
     handleUpdate({ message }) {
         const pending = message?.id && this.pendingEmbeds.get(message.id);
         if (!pending) return;
-        const media = this.extractMedia(message);
-        if (!media) return;
-        this.pendingEmbeds.delete(message.id);
-        this.sendToRust({
-            ...pending.base,
-            content: "",
-            media_update: true,
-            media_url: media.url,
-            media_kind: media.kind
-        });
+        const fresh = this.extractMedia(message).filter(m => !pending.sent.has(m.url));
+        if (!fresh.length) return;
+        fresh.forEach(m => pending.sent.add(m.url));
+        this.sendToRust({ ...pending.base, content: "", media_update: true, media: fresh });
     }
 
     handleMessage({ message }) {
@@ -182,18 +179,14 @@ module.exports = class DunstBridge {
                 accent_color: message.guild_id ? "#cba6f7" : "#f38ba8",
                 position: message.guild_id ? "top-right" : "top-left"
             };
-            this.sendToRust({
-                ...base,
-                content: text || (media ? "" : "Sent an attachment"),
-                media_url: media?.url,
-                media_kind: media?.kind
-            });
+            const fallback = media.length ? `🖼️ Sent ${media.length === 1 ? "an image" : media.length + " images"}` : "Sent an attachment";
+            this.sendToRust({ ...base, content: text || fallback, media });
 
-            // A link with no embed yet may get one in a moment; remember it for MESSAGE_UPDATE.
-            if (!media && /https?:\/\//.test(text)) {
+            // A link may get its embed a moment later; remember it for MESSAGE_UPDATE.
+            if (/https?:\/\//.test(text)) {
                 const now = Date.now();
                 for (const [id, p] of this.pendingEmbeds) if (now - p.t > 30000) this.pendingEmbeds.delete(id);
-                this.pendingEmbeds.set(message.id, { t: now, base });
+                this.pendingEmbeds.set(message.id, { t: now, base, sent: new Set(media.map(m => m.url)) });
             }
         }
     }
@@ -366,7 +359,7 @@ module.exports = class DunstBridge {
 
         // Fake DM with an image (text + picture), to check the toast preview and the click-to-zoom viewer.
         const imageBtn = document.createElement("button");
-        imageBtn.innerText = "🖼️ Simulate Image DM";
+        imageBtn.innerText = "🖼️ Simulate Image DM (3 pictures)";
         imageBtn.className = "bd-button";
         imageBtn.style.padding = "10px 16px";
         imageBtn.style.borderRadius = "8px";
@@ -378,8 +371,11 @@ module.exports = class DunstBridge {
                 avatar: "https://cdn.discordapp.com/embed/avatars/3.png",
                 sound_path: this.soundPath,
                 accent_color: "#fab387",
-                media_url: "https://picsum.photos/id/1015/1600/1000",
-                media_kind: "image"
+                media: [
+                    { url: "https://picsum.photos/id/1015/1600/1000", kind: "image" },
+                    { url: "https://picsum.photos/id/1025/1200/1200", kind: "image" },
+                    { url: "https://picsum.photos/id/1035/900/1400", kind: "image" }
+                ]
             });
         };
 
