@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
     event::{Event, StartCause, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
     window::{Theme, Window, WindowBuilder},
 };
 use tray_icon::{
@@ -90,8 +90,10 @@ enum CustomEvent {
     AttachMedia(ToastPayload),
     /// A media card was clicked: open its image/gif in the browser.
     OpenMedia(String),
-    /// The media window's timer ran out.
-    MediaDone,
+    /// The media cards' shared timer ran out (carries the epoch it was started in).
+    MediaDone(usize),
+    /// A media card finished loading its picture and can be shown.
+    MediaCardReady(tao::window::WindowId),
     Menu(tray_icon::menu::MenuId),
 }
 
@@ -118,8 +120,6 @@ const REEL_BASE: (f64, f64) = (380.0, 670.0);
 const MEDIA_GAP: f64 = 12.0;
 const MEDIA_MAX: usize = 6; // 3 columns x 2 rows
 const MEDIA_COLS: usize = 3;
-/// Number of cards the media window currently holds; decides its size (see `media_layout`).
-static MEDIA_COUNT: AtomicUsize = AtomicUsize::new(0);
 const EDGE_MARGIN: f64 = 24.0;
 const TOP_MARGIN: f64 = 35.0;
 
@@ -176,8 +176,8 @@ enum Anchor {
     /// Centered on the monitor; if `Some(reel_left)` (physical px), pushed left to stay clear of the reel player.
     TopCenter(Option<i32>),
     TopRight,
-    /// Horizontally centered on `center_x`, starting just under `top` (both physical px).
-    Below { center_x: i32, top: i32 },
+    /// Top-left corner at exactly (x, y), physical px.
+    At { x: i32, y: i32 },
 }
 
 /// Re-places the toast, pushing it left if the reel player is visible and would overlap it.
@@ -190,8 +190,22 @@ fn place_toast(toast_window: &Window, toast_webview: &wry::WebView, reel_window:
     apply_layout(toast_window, toast_webview, TOAST_BASE, percent, Anchor::TopCenter(reel_left));
 }
 
-/// Card size and total window size (100% scale, logical px) for `n` cards: one card is as wide as the
-/// toast; several are smaller 16:9 cards in a grid of up to 3 columns.
+/// Monitor (x, y, width, height, dpi scale) in physical px that `window` is on.
+fn monitor_geom(window: &Window) -> (f64, f64, f64, f64, f64) {
+    match window.primary_monitor().or_else(|| window.current_monitor()) {
+        Some(m) => (
+            m.position().x as f64,
+            m.position().y as f64,
+            m.size().width as f64,
+            m.size().height as f64,
+            m.scale_factor(),
+        ),
+        None => (0.0, 0.0, 1920.0, 1080.0, 1.0),
+    }
+}
+
+/// Card size and whole-grid size (100% scale, logical px) for `n` cards: a single card is as wide as
+/// the toast; several are smaller 16:9 cards in a grid of up to 3 columns.
 fn media_layout(n: usize) -> ((f64, f64), (f64, f64)) {
     if n <= 1 {
         return ((TOAST_BASE.0, 551.0), (TOAST_BASE.0, 551.0));
@@ -202,107 +216,208 @@ fn media_layout(n: usize) -> ((f64, f64), (f64, f64)) {
     ((cols * cell.0 + (cols - 1.0) * MEDIA_GAP, rows * cell.1 + (rows - 1.0) * MEDIA_GAP), cell)
 }
 
-/// Sizes the media window for its current cards and places it directly under the toast.
-fn place_media(media_window: &Window, media_webview: &wry::WebView, toast_window: &Window, percent: f64) {
-    if let Ok(pos) = toast_window.outer_position() {
-        let size = toast_window.outer_size();
-        let anchor = Anchor::Below { center_x: pos.x + size.width as i32 / 2, top: pos.y + size.height as i32 };
-        let (base, _) = media_layout(MEDIA_COUNT.load(Ordering::Relaxed));
-        apply_layout(media_window, media_webview, base, percent, anchor);
-    }
+/// One picture in its own small transparent window (so no big canvas has to be resized and cleared).
+/// Field order matters: the webview must be dropped before the window it lives in.
+struct MediaCard {
+    webview: wry::WebView,
+    window: Window,
+    url: String,
 }
 
-/// The picture cards currently in the media window. They all share one timer: 5s plus 3s per extra card.
+/// The picture cards shown under the toast. All cards share one timer: 5s plus 3s per extra card.
 #[derive(Default)]
-struct MediaState {
-    cards: Vec<serde_json::Value>,
+struct MediaGrid {
+    cards: Vec<MediaCard>,
     /// Pictures that did not fit in the grid.
     overflow: usize,
+    /// Bumped on every change so an older timer can tell it has been superseded.
+    epoch: usize,
+    previewing: bool,
 }
 
-impl MediaState {
-    /// Adds the payload's pictures (skipping duplicates). Returns whether the window needs refreshing.
-    fn add(&mut self, payload: &ToastPayload, accent: &str) -> bool {
+impl MediaGrid {
+    fn make_card(
+        target: &EventLoopWindowTarget<CustomEvent>,
+        proxy: &EventLoopProxy<CustomEvent>,
+        url: &str,
+        kind: &str,
+        author: &str,
+        accent: &str,
+    ) -> Option<MediaCard> {
+        let window = WindowBuilder::new()
+            .with_title("DunstMedia")
+            .with_inner_size(LogicalSize::new(640.0, 360.0))
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top(true)
+            .with_resizable(false)
+            .with_visible(false)
+            .build(target)
+            .ok()?;
+        let id = window.id();
+        let proxy_card = proxy.clone();
+        let open_url = url.to_string();
+        let init = serde_json::json!({ "url": url, "kind": kind, "author": author, "accent": accent });
+        let webview = WebViewBuilder::new()
+            .with_transparent(true)
+            .with_background_color((0, 0, 0, 0))
+            .with_ipc_handler(move |req| {
+                let body = req.body();
+                if body == "ready" {
+                    let _ = proxy_card.send_event(CustomEvent::MediaCardReady(id));
+                } else if body == "open" {
+                    let _ = proxy_card.send_event(CustomEvent::OpenMedia(open_url.clone()));
+                }
+            })
+            .with_html(include_str!("media_card.html").replace("__INIT__", &init.to_string()))
+            .build(&window)
+            .ok()?;
+        Some(MediaCard { webview, window, url: url.to_string() })
+    }
+
+    /// Adds the payload's pictures (skipping duplicates). Returns whether anything changed.
+    fn add(
+        &mut self,
+        target: &EventLoopWindowTarget<CustomEvent>,
+        proxy: &EventLoopProxy<CustomEvent>,
+        payload: &ToastPayload,
+        accent: &str,
+    ) -> bool {
         let mut changed = false;
         for m in &payload.media {
-            if self.cards.iter().any(|c| c["url"] == m.url.as_str()) {
+            if self.cards.iter().any(|c| c.url == m.url) {
                 continue;
             }
+            changed = true;
             if self.cards.len() >= MEDIA_MAX {
                 self.overflow += 1;
-            } else {
-                self.cards.push(serde_json::json!({
-                    "url": m.url, "kind": m.kind, "author": payload.author, "accent": accent,
-                }));
+            } else if let Some(card) = Self::make_card(target, proxy, &m.url, &m.kind, &payload.author, accent) {
+                self.cards.push(card);
             }
-            changed = true;
         }
         changed
     }
 
+    /// Closes every card window.
     fn clear(&mut self) {
         self.cards.clear();
         self.overflow = 0;
-        MEDIA_COUNT.store(0, Ordering::Relaxed);
+        self.previewing = false;
+        self.epoch += 1;
     }
 
-    /// Resizes the window for the current cards, redraws them, restarts the shared timer and shows it.
-    fn show(&self, window: &Window, webview: &wry::WebView, toast_window: &Window, percent: f64) {
-        MEDIA_COUNT.store(self.cards.len(), Ordering::Relaxed);
-        place_media(window, webview, toast_window, percent);
-        let (_, cell) = media_layout(self.cards.len());
-        let duration_ms = 5000 + 3000 * self.cards.len().saturating_sub(1);
-        let js = format!(
-            "showMedia({}, {}, {}, {}, {}, {});",
-            serde_json::Value::Array(self.cards.clone()),
-            cell.0,
-            cell.1,
-            MEDIA_GAP,
-            duration_ms,
-            self.overflow
-        );
-        let _ = webview.evaluate_script(&js);
-        window.set_visible(true);
-        window.set_always_on_top(true);
+    /// A single sample card for the size-settings preview. It has no timer.
+    fn show_preview(
+        &mut self,
+        target: &EventLoopWindowTarget<CustomEvent>,
+        proxy: &EventLoopProxy<CustomEvent>,
+        toast_window: &Window,
+        percent: f64,
+    ) {
+        self.clear();
+        if let Some(card) = Self::make_card(target, proxy, "preview", "preview", "Preview", "#cba6f7") {
+            self.cards.push(card);
+            self.previewing = true;
+            self.layout(toast_window, percent);
+            self.update_cards(0);
+        }
+    }
+
+    /// Positions the cards as a grid directly under the toast, all at one common scale that fits the screen.
+    fn layout(&self, toast_window: &Window, percent: f64) {
+        let n = self.cards.len();
+        let Ok(toast_pos) = toast_window.outer_position() else { return };
+        if n == 0 {
+            return;
+        }
+        let toast_size = toast_window.outer_size();
+        let (mx, my, mw, mh, dpi) = monitor_geom(toast_window);
+        let margin = EDGE_MARGIN * dpi;
+        let center_x = toast_pos.x as f64 + toast_size.width as f64 / 2.0;
+        let top = (toast_pos.y + toast_size.height as i32) as f64 + MEDIA_GAP * dpi;
+
+        let (grid, cell) = media_layout(n);
+        let scale = (percent / 100.0)
+            .min((mw - 2.0 * margin) / (grid.0 * dpi))
+            .min((my + mh - top - margin) / (grid.1 * dpi))
+            .max(0.1);
+        let (cw, ch, gap) = ((cell.0 * scale * dpi).round(), (cell.1 * scale * dpi).round(), (MEDIA_GAP * scale * dpi).round());
+
+        for (i, card) in self.cards.iter().enumerate() {
+            let (row, col) = (i / MEDIA_COLS, i % MEDIA_COLS);
+            // The last row may be short; it is centered on its own.
+            let in_row = (n - row * MEDIA_COLS).min(MEDIA_COLS) as f64;
+            let row_w = in_row * cw + (in_row - 1.0) * gap;
+            let left = (center_x - row_w / 2.0).max(mx + margin).min(mx + mw - row_w - margin);
+            let x = left + col as f64 * (cw + gap);
+            let y = top + row as f64 * (ch + gap);
+            apply_layout(
+                &card.window,
+                &card.webview,
+                cell,
+                scale * 100.0,
+                Anchor::At { x: x.round() as i32, y: y.round() as i32 },
+            );
+        }
+    }
+
+    /// Tells every card the shared countdown length (0 = none) and puts "+N more" on the last card.
+    fn update_cards(&self, duration_ms: usize) {
+        let last = self.cards.len().saturating_sub(1);
+        for (i, card) in self.cards.iter().enumerate() {
+            let more = if i == last && self.overflow > 0 { format!("+{} more", self.overflow) } else { String::new() };
+            let _ = card.webview.evaluate_script(&format!("update({}, {:?});", duration_ms, more));
+        }
+    }
+
+    /// How long the cards stay up: 5s plus 3s per extra card. The toast stays up at least this long too.
+    fn duration_ms(&self) -> usize {
+        5000 + 3000 * self.cards.len().saturating_sub(1)
+    }
+
+    /// Re-lays out, restarts the shared countdown and schedules the moment all cards disappear together.
+    fn refresh(&mut self, proxy: &EventLoopProxy<CustomEvent>, toast_window: &Window, percent: f64) {
+        self.layout(toast_window, percent);
+        let duration_ms = self.duration_ms();
+        self.update_cards(duration_ms);
+        self.epoch += 1;
+        let (epoch, proxy) = (self.epoch, proxy.clone());
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(duration_ms as u64));
+            let _ = proxy.send_event(CustomEvent::MediaDone(epoch));
+        });
+    }
+
+    /// Shows a card once its picture has loaded (so an empty or half-drawn window never flashes).
+    fn reveal(&self, id: tao::window::WindowId) {
+        if let Some(card) = self.cards.iter().find(|c| c.window.id() == id) {
+            card.window.set_visible(true);
+            card.window.set_always_on_top(true);
+        }
     }
 }
 
-/// Places the toast, then keeps the media window attached under it if it is showing.
+/// Places the toast, then keeps the media cards attached under it.
 fn place_dunst(
     toast_window: &Window,
     toast_webview: &wry::WebView,
     reel_window: &Window,
-    media_window: &Window,
-    media_webview: &wry::WebView,
+    media: &MediaGrid,
     percent: f64,
 ) {
     place_toast(toast_window, toast_webview, reel_window, percent);
-    if media_window.is_visible() {
-        place_media(media_window, media_webview, toast_window, percent);
-    }
+    media.layout(toast_window, percent);
 }
 
 /// Sizes and positions `window` on its monitor in physical pixels (DPI-aware), capping the scale so it
 /// always fits on screen, then zooms the webview to match. Returns the effective scale factor applied.
 fn apply_layout(window: &Window, webview: &wry::WebView, base: (f64, f64), percent: f64, anchor: Anchor) -> f64 {
-    let (mx, my, mw, mh, dpi) = match window.primary_monitor().or_else(|| window.current_monitor()) {
-        Some(m) => (
-            m.position().x as f64,
-            m.position().y as f64,
-            m.size().width as f64,
-            m.size().height as f64,
-            m.scale_factor(),
-        ),
-        None => (0.0, 0.0, 1920.0, 1080.0, 1.0),
-    };
+    let (mx, my, mw, mh, dpi) = monitor_geom(window);
     let margin = EDGE_MARGIN * dpi;
     let top = TOP_MARGIN * dpi;
     let max_by_w = (mw - 2.0 * margin) / (base.0 * dpi);
     let gap = 12.0 * dpi;
-    let max_by_h = match anchor {
-        Anchor::Below { top: below, .. } => (my + mh - below as f64 - gap - margin) / (base.1 * dpi),
-        _ => (mh - top - margin) / (base.1 * dpi),
-    };
+    let max_by_h = (mh - top - margin) / (base.1 * dpi);
     // If the reel is in the way, the toast may use only the space to its left (shrinks only when it can't fit at all).
     let max_by_w = match anchor {
         Anchor::TopCenter(Some(reel_left)) => {
@@ -321,10 +436,10 @@ fn apply_layout(window: &Window, webview: &wry::WebView, base: (f64, f64), perce
             centered.min(reel_left as f64 - gap - w).max(mx + margin)
         }
         Anchor::TopRight => mx + mw - w - margin,
-        Anchor::Below { center_x, .. } => (center_x as f64 - w / 2.0).max(mx + margin).min(mx + mw - w - margin),
+        Anchor::At { x, .. } => x as f64,
     };
     let y = match anchor {
-        Anchor::Below { top: below, .. } => below as f64 + gap,
+        Anchor::At { y, .. } => y as f64,
         _ => my + top,
     };
     let (px, py) = (x.round() as i32, y.round() as i32);
@@ -1560,33 +1675,8 @@ fn main() {
         .build(&settings_window)
         .unwrap();
 
-    // Media window: sits under the toast and shows the message's images/gifs as a grid of cards.
-    let media_window = WindowBuilder::new()
-        .with_title("DunstMedia")
-        .with_inner_size(LogicalSize::new(TOAST_BASE.0, 551.0))
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_always_on_top(true)
-        .with_resizable(false)
-        .with_visible(false)
-        .build(&event_loop)
-        .unwrap();
-    let proxy_media = proxy.clone();
-    let media_webview = WebViewBuilder::new()
-        .with_transparent(true)
-        .with_background_color((0, 0, 0, 0))
-        .with_ipc_handler(move |req| {
-            let body = req.body();
-            if body == "media_done" {
-                let _ = proxy_media.send_event(CustomEvent::MediaDone);
-            } else if let Some(url) = body.strip_prefix("open_media:") {
-                let _ = proxy_media.send_event(CustomEvent::OpenMedia(url.to_string()));
-            }
-        })
-        .with_html(include_str!("media.html"))
-        .build(&media_window)
-        .unwrap();
-    let mut media = MediaState::default();
+    // Picture cards under the toast: one small window per picture, created when a message has pictures.
+    let mut media = MediaGrid::default();
 
     #[cfg(feature = "debug-hooks")]
     hooks::install(proxy.clone());
@@ -1611,7 +1701,7 @@ fn main() {
     let id_clear = item_clear_queue.id().clone();
     let id_quit = item_quit.id().clone();
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::NewEvents(StartCause::Init) => {},
@@ -1633,12 +1723,12 @@ fn main() {
             },
             Event::UserEvent(CustomEvent::SetToastScale(p)) => {
                 settings.toast_scale = p;
-                place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, p);
+                place_dunst(&toast_window, &toast_webview, &reel_window, &media, p);
             },
             Event::UserEvent(CustomEvent::SetReelScale(p)) => {
                 settings.reel_scale = p;
                 apply_layout(&reel_window, &reel_webview, REEL_BASE, p, Anchor::TopRight);
-                place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
+                place_dunst(&toast_window, &toast_webview, &reel_window, &media, settings.toast_scale);
             },
             Event::UserEvent(CustomEvent::SetTheme(t)) => {
                 settings_window.set_theme(theme_from_str(&t));
@@ -1663,23 +1753,16 @@ fn main() {
                         reel_window.set_visible(true);
                         reel_window.set_always_on_top(true);
                     }
-                    media.clear();
-                    MEDIA_COUNT.store(1, Ordering::Relaxed);
-                    media_window.set_visible(true);
-                    media_window.set_always_on_top(true);
-                    place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
-                    let (_, cell) = media_layout(1);
-                    let _ = media_webview.evaluate_script(&format!("previewMedia({}, {}, {});", cell.0, cell.1, MEDIA_GAP));
+                    place_toast(&toast_window, &toast_webview, &reel_window, settings.toast_scale);
+                    media.show_preview(target, &proxy, &toast_window, settings.toast_scale);
                 } else {
                     toast_window.set_visible(false);
                     media.clear();
-                    media_window.set_visible(false);
-                    let _ = media_webview.evaluate_script("clearMedia();");
                     if active_reel.is_none() {
                         reel_window.set_visible(false);
                         let _ = reel_webview.evaluate_script("stopReel();");
                     }
-                    place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
+                    place_dunst(&toast_window, &toast_webview, &reel_window, &media, settings.toast_scale);
                 }
             },
             Event::UserEvent(CustomEvent::ShowToast(payload)) => {
@@ -1715,7 +1798,7 @@ fn main() {
                 let _ = toast_webview.evaluate_script(&format!("setReplyEnabled({});", last_channel.is_some()));
 
                 let total_chars: usize = history.iter().map(|m| m.len()).sum();
-                let reading_time_ms = (4500 + (total_chars * 45)).clamp(4500, 20000) as u64;
+                let mut reading_time_ms = (4500 + (total_chars * 45)).clamp(4500, 20000) as u64;
 
                 if !item_mute.is_checked() {
                     if let Some(ref sound) = payload.sound_path {
@@ -1735,12 +1818,14 @@ fn main() {
                     }
                 }
 
-                place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
+                place_dunst(&toast_window, &toast_webview, &reel_window, &media, settings.toast_scale);
                 toast_window.set_visible(true);
                 toast_window.set_always_on_top(true);
 
-                if !preview_active && media.add(&payload, &accent) {
-                    media.show(&media_window, &media_webview, &toast_window, settings.toast_scale);
+                if !preview_active && media.add(target, &proxy, &payload, &accent) {
+                    media.refresh(&proxy, &toast_window, settings.toast_scale);
+                    // The toast leaves together with the pictures.
+                    reading_time_ms = reading_time_ms.max(media.duration_ms() as u64);
                 }
 
                 let current_id = notification_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1763,17 +1848,26 @@ fn main() {
                     return;
                 }
                 let accent = payload.accent_color.clone().unwrap_or_else(|| "#cba6f7".to_string());
-                if !preview_active && media.add(&payload, &accent) {
-                    media.show(&media_window, &media_webview, &toast_window, settings.toast_scale);
+                if !preview_active && media.add(target, &proxy, &payload, &accent) {
+                    media.refresh(&proxy, &toast_window, settings.toast_scale);
+                    // Pictures that arrive late restart the cards' timer, so the toast's restarts with it.
+                    if toast_window.is_visible() {
+                        let id = notification_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let (proxy_clone, ms) = (proxy.clone(), media.duration_ms() as u64);
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_millis(ms));
+                            let _ = proxy_clone.send_event(CustomEvent::HideToast(id));
+                        });
+                    }
                 }
             },
-            Event::UserEvent(CustomEvent::MediaDone) => {
-                if !preview_active {
+            Event::UserEvent(CustomEvent::MediaDone(epoch)) => {
+                // Ignore timers from before the cards last changed; the newer timer closes them.
+                if !preview_active && epoch == media.epoch {
                     media.clear();
-                    media_window.set_visible(false);
-                    let _ = media_webview.evaluate_script("clearMedia();");
                 }
             },
+            Event::UserEvent(CustomEvent::MediaCardReady(id)) => media.reveal(id),
             Event::UserEvent(CustomEvent::OpenMedia(url)) => {
                 if url.starts_with("http") && open_links_enabled.load(Ordering::Relaxed) {
                     let _ = open::that(url);
@@ -1815,7 +1909,7 @@ fn main() {
                     let _ = reel_webview.evaluate_script(&js);
                     reel_window.set_visible(true);
                     reel_window.set_always_on_top(true);
-                    place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
+                    place_dunst(&toast_window, &toast_webview, &reel_window, &media, settings.toast_scale);
                 } else {
                     reel_queue.push_back(item);
                     let js = format!("updateQueueCount({});", reel_queue.len());
@@ -1836,7 +1930,7 @@ fn main() {
                     active_reel = None;
                     reel_window.set_visible(false);
                     let _ = reel_webview.evaluate_script("stopReel();");
-                    place_dunst(&toast_window, &toast_webview, &reel_window, &media_window, &media_webview, settings.toast_scale);
+                    place_dunst(&toast_window, &toast_webview, &reel_window, &media, settings.toast_scale);
                 }
             },
             Event::UserEvent(CustomEvent::ClearReelQueue) => {

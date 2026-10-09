@@ -25,6 +25,30 @@ pub fn install(proxy: EventLoopProxy<CustomEvent>) {
         std::env::var("RICE_HOOK_STEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(400),
     );
 
+    // RICE_HOOK_MEDIA=<n>: show a toast carrying n pictures, to check the media cards' count, size and placement.
+    if let Some(n) = std::env::var("RICE_HOOK_MEDIA").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let proxy = proxy.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1500));
+            let media = (0..n)
+                .map(|i| crate::MediaItem { url: format!("https://picsum.photos/id/{}/1200/800", 1015 + i), kind: "image".into() })
+                .collect();
+            let _ = proxy.send_event(CustomEvent::ShowToast(crate::ToastPayload {
+                author: "HookUser".into(),
+                content: format!("{} pictures", n),
+                avatar: "https://cdn.discordapp.com/embed/avatars/0.png".into(),
+                sound_path: None,
+                accent_color: None,
+                position: None,
+                test: true,
+                channel_id: None,
+                media,
+                media_update: false,
+            }));
+        });
+        return;
+    }
+
     // RICE_HOOK_REPLY=<text>: show a toast tied to channel "123456", then submit <text> as a reply to it.
     // Check the result with `curl http://127.0.0.1:8999/outbox`.
     if let Ok(text) = std::env::var("RICE_HOOK_REPLY") {

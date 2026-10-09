@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { background: transparent !important; width: 100vw; height: 100vh; overflow: hidden;
+        font-family: 'JetBrains Mono', 'Segoe UI', sans-serif; user-select: none; }
+    #card { position: relative; width: 100%; height: 100%; overflow: hidden; cursor: pointer;
+        background: rgba(17, 17, 27, 0.96); border: 3px solid var(--accent); border-radius: 18px;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.8); animation: popIn 0.2s cubic-bezier(0.16, 1, 0.3, 1); }
+    #card img, #card video { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+    .fail { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+        color: rgba(205, 214, 244, 0.6); font-size: 16px; }
+    .who { position: absolute; left: 14px; bottom: 16px; padding: 4px 12px; border-radius: 999px; font-size: 14px;
+        font-weight: 700; color: #cdd6f4; background: rgba(17, 17, 27, 0.75); pointer-events: none; }
+    .more { position: absolute; right: 14px; top: 12px; padding: 4px 12px; border-radius: 999px; font-size: 14px;
+        font-weight: 700; color: #11111b; background: var(--accent); pointer-events: none; }
+    /* Countdown: the bar drains from right to left over the time the picture stays up. */
+    .bar { position: absolute; left: 0; bottom: 0; height: 5px; width: 100%; background: var(--accent);
+        transform-origin: left center; animation: drain var(--dur) linear forwards; pointer-events: none; }
+    @keyframes drain { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+    @keyframes popIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+</style>
+</head>
+<body>
+<div id="card"></div>
+<script>
+    const init = __INIT__;
+    const card = document.getElementById('card');
+    card.style.setProperty('--accent', init.accent);
+
+    let announced = false;
+    function ready() {
+        if (announced) return;
+        announced = true;
+        window.ipc.postMessage('ready');
+    }
+
+    let el;
+    if (init.kind === 'preview') {
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+            + '<stop offset="0" stop-color="#cba6f7"/><stop offset="1" stop-color="#89b4fa"/></linearGradient></defs>'
+            + '<rect width="1280" height="720" fill="url(#g)"/><text x="640" y="400" font-size="72" font-family="Segoe UI" fill="#11111b" text-anchor="middle">Image preview</text></svg>';
+        el = document.createElement('img');
+        el.src = 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+        el.addEventListener('load', ready);
+    } else if (init.kind === 'gifv') {
+        el = document.createElement('video');
+        el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true;
+        el.addEventListener('loadeddata', ready);
+        el.src = init.url;
+    } else {
+        el = document.createElement('img');
+        el.addEventListener('load', ready);
+        el.src = init.url;
+    }
+    el.draggable = false;
+    el.addEventListener('error', () => {
+        el.remove();
+        const fail = document.createElement('div');
+        fail.className = 'fail';
+        fail.textContent = "Couldn't load picture";
+        card.prepend(fail);
+        ready();
+    });
+    card.appendChild(el);
+    setTimeout(ready, 2500); // slow link: show the card anyway
+
+    const who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = '@' + init.author;
+    card.appendChild(who);
+
+    // Click opens the picture in the browser (the settings preview has nothing to open).
+    card.addEventListener('click', () => { if (init.kind !== 'preview') window.ipc.postMessage('open'); });
+
+    // Sets the shared countdown (durationMs 0 = none) and the optional "+N more" badge.
+    function update(durationMs, more) {
+        card.querySelectorAll('.bar, .more').forEach(n => n.remove());
+        if (durationMs > 0) {
+            const bar = document.createElement('div');
+            bar.className = 'bar';
+            bar.style.setProperty('--dur', durationMs + 'ms');
+            card.appendChild(bar);
+        }
+        if (more) {
+            const badge = document.createElement('div');
+            badge.className = 'more';
+            badge.textContent = more;
+            card.appendChild(badge);
+        }
+    }
+</script>
+</body>
+</html>
