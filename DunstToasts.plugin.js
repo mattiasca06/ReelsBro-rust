@@ -95,6 +95,30 @@ module.exports = class DunstBridge {
         });
     }
 
+    // Discord stores mentions as raw ids (<@123>, <@&role>, <#channel>, <:emoji:id>). Turn them into
+    // readable text for the toast. Unknown ids are left as they are.
+    resolveMentions(message) {
+        const guildId = message.guild_id;
+        const channelStore = BdApi.Webpack.getStore("ChannelStore");
+        const roleStore = BdApi.Webpack.getStore("GuildRoleStore");
+        const nameOf = u => u?.global_name || u?.username;
+
+        return (message.content || "")
+            .replace(/<@!?(\d+)>/g, (raw, id) => {
+                const name = nameOf(message.mentions?.find(u => u.id === id)) || nameOf(this.userStore.getUser(id));
+                return name ? `@${name}` : raw;
+            })
+            .replace(/<@&(\d+)>/g, (raw, id) => {
+                const role = guildId && roleStore?.getRole?.(guildId, id);
+                return role?.name ? `@${role.name}` : raw;
+            })
+            .replace(/<#(\d+)>/g, (raw, id) => {
+                const channel = channelStore?.getChannel?.(id);
+                return channel?.name ? `#${channel.name}` : raw;
+            })
+            .replace(/<a?:(\w+):\d+>/g, ":$1:");
+    }
+
     handleMessage({ message }) {
         if (!message || !this.userStore) return;
         const currentUser = this.userStore.getCurrentUser();
@@ -107,7 +131,7 @@ module.exports = class DunstBridge {
         if (isPinged || isDM) {
             this.sendToRust({
                 author: message.author.global_name || message.author.username || "Someone",
-                content: message.content || "Sent an attachment",
+                content: this.resolveMentions(message) || "Sent an attachment",
                 channel_id: message.channel_id,
                 avatar: message.author.avatar
                     ? `https://cdn.discordapp.com/avatars/${message.author.id}/${message.author.avatar}.png`
