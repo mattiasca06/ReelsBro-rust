@@ -40,6 +40,9 @@ pub fn install(proxy: EventLoopProxy<CustomEvent>) {
                 position: None,
                 test: true,
                 channel_id: Some("123456".into()),
+                media_url: None,
+                media_kind: None,
+                media_update: false,
             }));
             thread::sleep(step);
             let _ = proxy.send_event(CustomEvent::Reply(text));

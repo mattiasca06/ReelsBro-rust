@@ -2,7 +2,7 @@
  * @name DunstBridge
  * @author CustomRice
  * @description Bridges Discord pings & DMs to your local Rust Dunst server.
- * @version 2.2.0
+ * @version 2.3.0
  */
 
 module.exports = class DunstBridge {
@@ -21,6 +21,9 @@ module.exports = class DunstBridge {
 
         this.handleMessage = this.handleMessage.bind(this);
         this.dispatcher.subscribe("MESSAGE_CREATE", this.handleMessage);
+        this.pendingEmbeds = new Map();
+        this.handleUpdate = this.handleUpdate.bind(this);
+        this.dispatcher.subscribe("MESSAGE_UPDATE", this.handleUpdate);
         this.outboxTimer = setInterval(() => this.pollOutbox(), 1000);
         BdApi.UI.showToast("DunstBridge Connected to Rust Server!", { type: "success" });
     }
@@ -28,6 +31,7 @@ module.exports = class DunstBridge {
     stop() {
         if (this.dispatcher && this.handleMessage) {
             this.dispatcher.unsubscribe("MESSAGE_CREATE", this.handleMessage);
+            this.dispatcher.unsubscribe("MESSAGE_UPDATE", this.handleUpdate);
         }
         clearInterval(this.outboxTimer);
     }
@@ -119,19 +123,57 @@ module.exports = class DunstBridge {
             .replace(/<a?:(\w+):\d+>/g, ":$1:");
     }
 
+    // First image or gif of a message: an uploaded image, an image link, or a gif link (Tenor, Klipy,
+    // Giphy...). Gif embeds are delivered by Discord as a looping muted clip ("gifv"). Plain videos
+    // are ignored. Returns {url, kind} or null.
+    extractMedia(message) {
+        for (const a of message.attachments || []) {
+            if (a.content_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(a.filename || "")) {
+                return { url: a.url, kind: "image" };
+            }
+        }
+        for (const e of message.embeds || []) {
+            const provider = (e.provider?.name || "").toLowerCase();
+            const isGifSite = ["tenor", "giphy", "klipy"].includes(provider);
+            if ((e.type === "gifv" || isGifSite) && e.video?.url) return { url: e.video.url, kind: "gifv" };
+            if (e.type === "image") return { url: e.thumbnail?.url || e.url, kind: "image" };
+            if (e.type !== "video" && (e.image?.url || e.thumbnail?.url)) {
+                return { url: e.image?.url || e.thumbnail.url, kind: "image" };
+            }
+        }
+        return null;
+    }
+
+    // Link embeds are built by Discord after the message arrives, so they show up in MESSAGE_UPDATE.
+    handleUpdate({ message }) {
+        const pending = message?.id && this.pendingEmbeds.get(message.id);
+        if (!pending) return;
+        const media = this.extractMedia(message);
+        if (!media) return;
+        this.pendingEmbeds.delete(message.id);
+        this.sendToRust({
+            ...pending.base,
+            content: "",
+            media_update: true,
+            media_url: media.url,
+            media_kind: media.kind
+        });
+    }
+
     handleMessage({ message }) {
         if (!message || !this.userStore) return;
         const currentUser = this.userStore.getCurrentUser();
-        
+
         if (!currentUser || message.author?.id === currentUser.id) return;
 
         const isPinged = message.mentions?.some(u => u.id === currentUser.id) || message.mention_everyone;
         const isDM = !message.guild_id;
 
         if (isPinged || isDM) {
-            this.sendToRust({
+            const media = this.extractMedia(message);
+            const text = this.resolveMentions(message);
+            const base = {
                 author: message.author.global_name || message.author.username || "Someone",
-                content: this.resolveMentions(message) || "Sent an attachment",
                 channel_id: message.channel_id,
                 avatar: message.author.avatar
                     ? `https://cdn.discordapp.com/avatars/${message.author.id}/${message.author.avatar}.png`
@@ -139,7 +181,20 @@ module.exports = class DunstBridge {
                 sound_path: this.soundPath,
                 accent_color: message.guild_id ? "#cba6f7" : "#f38ba8",
                 position: message.guild_id ? "top-right" : "top-left"
+            };
+            this.sendToRust({
+                ...base,
+                content: text || (media ? "" : "Sent an attachment"),
+                media_url: media?.url,
+                media_kind: media?.kind
             });
+
+            // A link with no embed yet may get one in a moment; remember it for MESSAGE_UPDATE.
+            if (!media && /https?:\/\//.test(text)) {
+                const now = Date.now();
+                for (const [id, p] of this.pendingEmbeds) if (now - p.t > 30000) this.pendingEmbeds.delete(id);
+                this.pendingEmbeds.set(message.id, { t: now, base });
+            }
         }
     }
 
@@ -309,8 +364,28 @@ module.exports = class DunstBridge {
             else BdApi.UI.showToast("✅ Sent. Check that channel.", { type: "success" });
         };
 
+        // Fake DM with an image (text + picture), to check the toast preview and the click-to-zoom viewer.
+        const imageBtn = document.createElement("button");
+        imageBtn.innerText = "🖼️ Simulate Image DM";
+        imageBtn.className = "bd-button";
+        imageBtn.style.padding = "10px 16px";
+        imageBtn.style.borderRadius = "8px";
+        imageBtn.style.cursor = "pointer";
+        imageBtn.onclick = () => {
+            this.sendToRust({
+                author: "PicBro",
+                content: "look at this",
+                avatar: "https://cdn.discordapp.com/embed/avatars/3.png",
+                sound_path: this.soundPath,
+                accent_color: "#fab387",
+                media_url: "https://picsum.photos/id/1015/1600/1000",
+                media_kind: "image"
+            });
+        };
+
         panel.appendChild(singleBtn);
         panel.appendChild(spamBtn);
+        panel.appendChild(imageBtn);
         panel.appendChild(ytdlpBtn);
         panel.appendChild(reelBtn);
         panel.appendChild(checkBtn);

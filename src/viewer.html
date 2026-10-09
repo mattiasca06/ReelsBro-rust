@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    html, body { margin: 0; height: 100%; background: #11111b; overflow: hidden; user-select: none;
+        font-family: 'Segoe UI Variable Text', 'Segoe UI', sans-serif; }
+    #stage { position: absolute; inset: 0; overflow: hidden; cursor: grab; }
+    #stage.dragging { cursor: grabbing; }
+    #media { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; image-rendering: auto; }
+    #hud { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); background: rgba(30, 30, 46, 0.88);
+        color: #cdd6f4; padding: 6px 14px; border-radius: 999px; font-size: 12px; pointer-events: none;
+        opacity: 0; transition: opacity 0.2s; }
+    #hud.on { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="hud"></div>
+<script>
+    const stage = document.getElementById('stage');
+    const hud = document.getElementById('hud');
+    let el = null, nw = 0, nh = 0;
+    let scale = 1, fit = 1, tx = 0, ty = 0, fitted = true, hudTimer;
+
+    function showMedia(url, kind) {
+        stage.innerHTML = '';
+        nw = nh = 0;
+        if (kind === 'gifv') {
+            el = document.createElement('video');
+            el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true;
+            el.addEventListener('loadedmetadata', () => { nw = el.videoWidth; nh = el.videoHeight; reset(); });
+        } else {
+            el = document.createElement('img');
+            el.addEventListener('load', () => { nw = el.naturalWidth; nh = el.naturalHeight; reset(); });
+        }
+        el.id = 'media';
+        el.draggable = false;
+        el.src = url;
+        stage.appendChild(el);
+    }
+
+    function apply() {
+        el.style.width = nw + 'px';
+        el.style.height = nh + 'px';
+        el.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+        hud.textContent = Math.round(scale * 100) + '%';
+        hud.classList.add('on');
+        clearTimeout(hudTimer);
+        hudTimer = setTimeout(() => hud.classList.remove('on'), 900);
+    }
+
+    // Fit the image in the window (never upscaled past 100%) and center it.
+    function reset() {
+        if (!el || !nw) return;
+        const W = stage.clientWidth, H = stage.clientHeight;
+        fit = Math.min(W / nw, H / nh, 1);
+        scale = fit;
+        tx = (W - nw * scale) / 2;
+        ty = (H - nh * scale) / 2;
+        fitted = true;
+        apply();
+    }
+
+    // Zoom to `next`, keeping the point (mx, my) under the cursor fixed.
+    function zoomAt(next, mx, my) {
+        if (!el || !nw) return;
+        next = Math.min(Math.max(next, fit * 0.25), 50);
+        tx = mx - (mx - tx) * (next / scale);
+        ty = my - (my - ty) * (next / scale);
+        scale = next;
+        fitted = false;
+        apply();
+    }
+
+    stage.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        zoomAt(scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15), e.clientX, e.clientY);
+    }, { passive: false });
+
+    let drag = null;
+    stage.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        drag = { x: e.clientX - tx, y: e.clientY - ty };
+        stage.classList.add('dragging');
+    });
+    window.addEventListener('mousemove', (e) => {
+        if (!drag || !el) return;
+        tx = e.clientX - drag.x;
+        ty = e.clientY - drag.y;
+        fitted = false;
+        apply();
+    });
+    window.addEventListener('mouseup', () => { drag = null; stage.classList.remove('dragging'); });
+
+    // Double click toggles between fit and 100% at the cursor.
+    stage.addEventListener('dblclick', (e) => {
+        if (Math.abs(scale - fit) < 0.001 && fit < 1) zoomAt(1, e.clientX, e.clientY);
+        else reset();
+    });
+
+    window.addEventListener('keydown', (e) => {
+        const cx = stage.clientWidth / 2, cy = stage.clientHeight / 2;
+        if (e.key === 'Escape') window.ipc.postMessage('close');
+        else if (e.key === '+' || e.key === '=') zoomAt(scale * 1.25, cx, cy);
+        else if (e.key === '-') zoomAt(scale / 1.25, cx, cy);
+        else if (e.key === '0') reset();
+        else if (e.key === '1') zoomAt(1, cx, cy);
+    });
+
+    window.addEventListener('resize', () => { if (fitted) reset(); });
+</script>
+</body>
+</html>
